@@ -43,7 +43,6 @@ jobs:
 
   - task: CMake@1
     displayName: 'CMake ../ -GNinja -DUSE_ASAN=$(Asan) -DCMAKE_BUILD_TYPE=$(BuildType) -DCMAKE_CXX_FLAGS="-stdlib=libstdc++"'
-    cwd: build
     inputs:
       cmakeArgs: '../ -GNinja -DUSE_ASAN=$(Asan) -DCMAKE_BUILD_TYPE=$(BuildType) -DCMAKE_CXX_FLAGS="-stdlib=libstdc++" -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DVERONA_CI_BUILD=On -DRT_TESTS=On'
 
