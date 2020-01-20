@@ -95,9 +95,9 @@ jobs:
       dir /s /b
 
   - task: MSBuild@1
-    displayName: 'Build solution build/verona.sln'
+    displayName: 'Build solution build/verona-lang.sln'
     inputs:
-      solution: build/verona.sln
+      solution: build/verona-lang.sln
       msbuildArguments: '/m /p:Configuration=$(BuildType)'
 
   - script: |
