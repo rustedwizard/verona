@@ -109,7 +109,7 @@ jobs:
   - task: MSBuild@1
     displayName: 'Build solution build/verona-lang.sln'
     inputs:
-      solution: build/verona-lang.sln
+      solution: build/INSTALL.vcxproj
       msbuildArguments: '/m /p:Configuration=$(BuildType)'
 
   - script: |
