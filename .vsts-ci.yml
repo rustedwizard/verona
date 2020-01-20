@@ -8,18 +8,36 @@ jobs:
     vmImage: 'ubuntu-16.04'
   strategy:
     matrix:
-      Debug:
+      Clang-6 Debug:
+        CC: clang-6.0
+        CXX: clang++-6.0
+        CXXFLAGS: -stdlib=libstdc++
         BuildType: Debug
         Asan: Off
-      Release:
+      Clang-6 Release:
+        CC: clang-6.0
+        CXX: clang++-6.0
+        CXXFLAGS: -stdlib=libstdc++
         Asan: Off
         BuildType: Release
-      ASAN-Debug:
+      Clang-6 Debug (ASAN):
+        CC: clang-6.0
+        CXX: clang++-6.0
+        CXXFLAGS: -stdlib=libstdc++
         BuildType: Debug
         Asan: On
-      ASAN-Release:
+      Clang-6 Release (ASAN):
+        CC: clang-6.0
+        CXX: clang++-6.0
+        CXXFLAGS: -stdlib=libstdc++
         BuildType: Release
         Asan: On
+      GCC-7:
+        CC: gcc-7
+        CXX: g++-7
+        CXXFLAGS:
+        BuildType: Debug
+        Asan: Off
   steps:
   - checkout: self
     submodules: recursive
@@ -27,24 +45,20 @@ jobs:
   - script: |
       sudo add-apt-repository ppa:ubuntu-toolchain-r/test
       sudo apt-get update
-      sudo apt-get install -y ninja-build libc++-dev libc++abi-dev libc++abi1 libstdc++-7-dev llvm-6.0
-
-      sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-6.0 100
-      sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang 100
-      sudo update-alternatives --set cc /usr/bin/clang
-
-      sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-6.0 100
-      sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++ 100
-      sudo update-alternatives --set c++ /usr/bin/clang++
+      sudo apt-get install -y ninja-build libstdc++-7-dev clang-6.0 gcc-7 g++-7
 
       sudo pip install wheel OutputCheck
+      if [[ "$CXX" == clang++* ]]; then CMAKE_CXX_FLAGS+=" -stdlib=libstdc++"; fi
 
     displayName: 'Install Build Dependencies'
 
   - task: CMake@1
-    displayName: 'CMake ../ -GNinja -DUSE_ASAN=$(Asan) -DCMAKE_BUILD_TYPE=$(BuildType) -DCMAKE_CXX_FLAGS="-stdlib=libstdc++"'
+    displayName: 'CMake ../ -GNinja'
     inputs:
-      cmakeArgs: '../ -GNinja -DUSE_ASAN=$(Asan) -DCMAKE_BUILD_TYPE=$(BuildType) -DCMAKE_CXX_FLAGS="-stdlib=libstdc++" -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DVERONA_CI_BUILD=On -DRT_TESTS=On'
+      cmakeArgs: |
+        ../ -GNinja
+        -DCMAKE_BUILD_TYPE=$(BuildType) -DCMAKE_C_COMPILER=$(CC) -DCMAKE_CXX_COMPILER=$(CXX) -DCMAKE_CXX_FLAGS=$(CXXFLAGS)
+        -DUSE_ASAN=$(Asan) -DVERONA_CI_BUILD=On -DRT_TESTS=On
 
   - script: |
       ninja -j4 install
@@ -101,13 +115,13 @@ jobs:
       msbuildArguments: '/m /p:Configuration=$(BuildType)'
 
   - script: |
-      ctest -j 4 -E "([1-9][0-9]00|[4-9]00)" --timeout 400 --output-on-failure --interactive-debug-mode 0
+      ctest -j 4 -E "([1-9][0-9]00|[4-9]00)" --timeout 400 --output-on-failure --interactive-debug-mode 0 -C $(BuildType)
     workingDirectory: build/src/rt
     failOnStderr: true
     displayName: Runtime test suite
 
   - script: |
-      ctest -j 4 --timeout 400 --output-on-failure --interactive-debug-mode 0
+      ctest -j 4 --timeout 400 --output-on-failure --interactive-debug-mode 0 -C $(BuildType)
     workingDirectory: build/testsuite
     failOnStderr: true
     displayName: Language test suite
