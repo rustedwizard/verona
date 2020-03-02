@@ -43,9 +43,11 @@ namespace verona::interpreter
     /**
      * Run finaliser for this VM object.
      *
-     * This creates a new frame in the thread local VMs state.
+     * This creates a new frame in the thread local VMs state. Existing running
+     * frames will be restored after the finaliser completes.
      *
-     * Existing running frames will be restored after the finaliser completes.
+     * This assumes that `object` does indeed have a finaliser, found in its
+     * descriptor's finaliser_ip field.
      **/
     static void execute_finaliser(VMObject* object);
 
@@ -138,7 +140,8 @@ namespace verona::interpreter
     }
 
     template<typename... Args>
-    [[noreturn]] void fatal(std::string_view fmt, Args&&... args) const {
+    [[noreturn]] void fatal(std::string_view fmt, Args&&... args) const
+    {
       fmt::print(std::cerr, "[{:4x}]: {:<{}}FATAL: ", start_ip_, "", indent_);
       fmt::print(std::cerr, fmt, std::forward<Args>(args)...);
       fmt::print(std::cerr, "\n");

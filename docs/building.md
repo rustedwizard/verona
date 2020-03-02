@@ -81,8 +81,7 @@ First, you will need to install dependencies:
 sudo apt update        # optional, if you haven't updated recently
 sudo apt dist-upgrade  # optional, if you haven't updated recently
 sudo apt install cmake ninja-build python3 \
-                 clang clang-format clang-tools \
-                 llvm
+                 clang-8 clang-format clang-tools
 ```
 
 ## Prerequisites to build on macOS
@@ -125,7 +124,7 @@ to provide the other configurations.
 Note: Sometimes `cmake` detects `gcc` instead of `clang`.
 To override this, run `cmake` with environment variables, for example:
 ```
-CC=clang CXX=clang++ cmake .. -GNinja -DCMAKE_BUILD_TYPE=Debug
+cmake .. -GNinja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DCMAKE_C_COMPILER=/usr/bin/clang
 ```
 This may require you to remove your CMakeCache.txt file from the build
 directory.

@@ -7,6 +7,8 @@ option(USE_ASAN "Use address sanitizer" OFF)
 option(USE_QUICK_EXIT "Enable the use of quick_exit in the C++ API" ON)
 option(VERONA_CI_BUILD "Disable features not sensible for CI" OFF)
 
+option(USE_SYSTEMATIC_TESTING "Enable systematic testing in the runtime" OFF)
+option(USE_CRASH_LOGGING "Enable crash logging in the runtime" OFF)
 
 set(SNMALLOC_ONLY_HEADER_LIBRARY ON)
 add_subdirectory(external/snmalloc EXCLUDE_FROM_ALL)
@@ -46,7 +48,15 @@ if(USE_ASAN)
   endif()
   target_compile_definitions(verona_rt INTERFACE -DUSE_MALLOC)
   target_compile_options(verona_rt INTERFACE -g -fsanitize=address -fno-omit-frame-pointer)
-  target_link_libraries(verona_rt INTERFACE -lasan)
+  target_link_libraries(verona_rt INTERFACE -fsanitize=address)
+endif()
+
+if(USE_SYSTEMATIC_TESTING)
+  target_compile_definitions(verona_rt INTERFACE USE_SYSTEMATIC_TESTING)
+endif()
+
+if(USE_CRASH_LOGGING)
+  target_compile_definitions(verona_rt INTERFACE USE_FLIGHT_RECORDER)
 endif()
 
 if(USE_EXECINFO)

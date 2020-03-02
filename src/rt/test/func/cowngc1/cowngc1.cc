@@ -64,6 +64,15 @@ struct PRNG
     return rand();
 #endif
   }
+
+  void seed(size_t seed)
+  {
+#ifdef USE_SYSTEMATIC_TESTING
+    return rand.set_state(seed);
+#else
+    return rand.seed(seed);
+#endif
+  }
 };
 
 static constexpr uint64_t others_count = 3;
@@ -84,13 +93,6 @@ struct O : public V<O<region_type>, region_type>
       st->push(f1);
     if (cown != nullptr)
       st->push(cown);
-  }
-
-  // We need this so O is considered as needing finalisation, so that
-  // `Region::cown_scan` will trace the cown pointer.
-  void trace_possibly_iso(ObjectStack* st)
-  {
-    trace(st);
   }
 };
 using OTrace = O<RegionType::Trace>;
@@ -359,10 +361,15 @@ struct Ping : public VAction<Ping>
   }
 };
 
-void test_cown_gc(uint64_t forward_count, size_t ring_size, PRNG* rand)
+void test_cown_gc(
+  uint64_t forward_count,
+  size_t ring_size,
+  SystematicTestHarness* h,
+  PRNG* rand)
 {
   rcown_first = nullptr;
   auto a = new RCown(ring_size, forward_count);
+  rand->seed(h->current_seed());
   Cown::schedule<Ping>(a, a, rand);
 }
 
@@ -376,12 +383,12 @@ void test_cown_gc_before_sched()
 int main(int argc, char** argv)
 {
   SystematicTestHarness harness(argc, argv);
-  PRNG rand(harness.seed);
+  PRNG rand(harness.seed_lower);
 
   size_t ring = harness.opt.is<size_t>("--ring", 10);
-  size_t forward = harness.opt.is<size_t>("--forward", 10);
+  uint64_t forward = harness.opt.is<uint64_t>("--forward", 10);
 
-  harness.run(test_cown_gc, forward, ring, &rand);
+  harness.run(test_cown_gc, forward, ring, &harness, &rand);
   harness.run(test_cown_gc_before_sched);
 
   return 0;
