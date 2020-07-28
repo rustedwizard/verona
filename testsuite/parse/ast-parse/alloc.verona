@@ -1,0 +1,8 @@
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
+
+foo()
+{
+  let r1 = new Foo;
+  let f = [A](a) where A: U64 { a + 42 };
+}

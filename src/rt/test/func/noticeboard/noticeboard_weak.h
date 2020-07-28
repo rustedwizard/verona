@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 namespace noticeboard_weak
 {
   struct C : public V<C>
@@ -18,13 +18,13 @@ namespace noticeboard_weak
 
     Writer(Object* c_0, Object* c_1) : box_0{c_0}, box_1{c_1}
     {
-#ifdef USE_SYSTEMATIC_TESTING
+#ifdef USE_SYSTEMATIC_TESTING_WEAK_NOTICEBOARDS
       register_noticeboard(&box_0);
       register_noticeboard(&box_1);
 #endif
     }
 
-    void trace(ObjectStack* fields) const
+    void trace(ObjectStack& fields) const
     {
       box_0.trace(fields);
       box_1.trace(fields);

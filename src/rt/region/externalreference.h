@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "../object/object.h"
@@ -33,7 +33,7 @@ namespace verona::rt
       // The object externally referred to
       Object* o;
 
-      static void gc_trace(const Object*, ObjectStack*) {}
+      static void gc_trace(const Object*, ObjectStack&) {}
 
       static const Descriptor* desc()
       {
@@ -44,21 +44,24 @@ namespace verona::rt
       }
 
       // May only be called if there's a ext_ref for o in rs.
-      static ExternalRef* find_ext_ref(ExternalReferenceTable* ert, Object* o)
+      static ExternalRef*
+      find_ext_ref(ExternalReferenceTable* ert, const Object* o)
       {
-        auto i = ert->external_map->find((size_t)o);
+        auto i = ert->external_map->find(o);
         assert(i != ert->external_map->end());
-        return i->second.get_wref();
+        assert(i.value());
+        return i.value();
       }
 
-      ExternalRef(ExternalReferenceTable* ert_, Object* o_) : ert{ert_}, o{o_}
+      ExternalRef(ExternalReferenceTable* ert_, Object* o_)
+      : Object(desc()), ert{ert_}, o{o_}
       {
         set_descriptor(desc());
         make_scc();
 
-        auto pair = std::make_pair((size_t)o, ExternalRefHolder{this});
+        incref();
         ert.load(std::memory_order_relaxed)
-          ->external_map->insert_unique(ThreadAlloc::get(), pair);
+          ->insert(ThreadAlloc::get(), o, this);
 
         o->set_has_ext_ref();
       }
@@ -104,111 +107,67 @@ namespace verona::rt
       }
     };
 
-    /**
-     * ExternalRef wrapper holding the regions ownership on the ExternalRef.
-     * Destructor invalidates the ExternalRef.
-     */
-    class ExternalRefHolder
-    {
-    private:
-      ExternalRef* ext_ref;
-
-    public:
-      ExternalRefHolder() : ext_ref{nullptr} {}
-
-      explicit ExternalRefHolder(ExternalRef* ext_ref_) : ext_ref{ext_ref_}
-      {
-        assert(ext_ref);
-        ext_ref->incref();
-      }
-
-      ExternalRefHolder(const ExternalRefHolder&) = delete;
-
-      ExternalRefHolder& operator=(const ExternalRefHolder&) = delete;
-
-      ExternalRefHolder(ExternalRefHolder&& other) noexcept
-      : ext_ref{other.ext_ref}
-      {
-        if (this != &other)
-        {
-          other.ext_ref = nullptr;
-        }
-      }
-
-      ExternalRefHolder& operator=(ExternalRefHolder&& other) noexcept
-      {
-        if (this != &other)
-        {
-          ext_ref = other.ext_ref;
-          other.ext_ref = nullptr;
-        }
-        return *this;
-      }
-
-      void set_ert(ExternalReferenceTable* ert_)
-      {
-        assert(ext_ref->o);
-        ext_ref->ert.store(ert_, std::memory_order_relaxed);
-      }
-
-      ExternalRef* get_wref()
-      {
-        assert(ext_ref);
-        return ext_ref;
-      }
-
-      ~ExternalRefHolder()
-      {
-        if (ext_ref)
-        {
-          // The object this external ref points to has been collected, so we
-          // need to invalidate this ext_ref so that `is_in` return false.
-          ext_ref->o = nullptr;
-          ext_ref->ert.store(nullptr, std::memory_order_relaxed);
-          Alloc* alloc = ThreadAlloc::get();
-          Immutable::release(alloc, ext_ref);
-        }
-      }
-    };
-
-    static size_t& external_map_key_of(std::pair<size_t, ExternalRefHolder>* e)
-    {
-      return e->first;
-    }
-
     // No tracing is need for external_map, because entries in the map doesn't
     // contribute to objects RC; when an object is collected, its corresponding
     // entry in the map (if any) is removed as well.
-    using ExternalMap =
-      PtrKeyHashMap<std::pair<size_t, ExternalRefHolder>, external_map_key_of>;
+    using ExternalMap = ObjectMap<std::pair<Object*, ExternalRef*>>;
 
     ExternalMap* external_map;
 
   public:
     ExternalReferenceTable()
-    {
-      external_map = ExternalMap::create();
-    }
+    : external_map(ExternalMap::create(ThreadAlloc::get()))
+    {}
 
-    inline void dealloc(Alloc* alloc)
+    void dealloc(Alloc* alloc)
     {
+      for (auto it = external_map->begin(); it != external_map->end(); ++it)
+        remove_ref(alloc, it);
+
       external_map->dealloc(alloc);
       alloc->dealloc<sizeof(ExternalMap)>(external_map);
     }
 
     void merge(Alloc* alloc, ExternalReferenceTable* that)
     {
-      for (auto& e : *that->external_map)
+      for (auto e : *that->external_map)
       {
-        e.second.set_ert(this);
-        auto pair = std::make_pair(e.first, std::move(e.second));
-        external_map->insert_unique(alloc, pair);
+        auto* ext_ref = *e.second;
+        assert(ext_ref->o);
+        ext_ref->ert.store(this, std::memory_order_relaxed);
+        *e.second = nullptr;
+        insert(alloc, e.first, ext_ref);
       }
     }
 
-    void erase(Object* p)
+    void insert(Alloc* alloc, Object* object, ExternalRef* ext_ref)
     {
-      external_map->erase(p);
+      auto unique =
+        external_map->insert(alloc, std::make_pair(object, ext_ref)).first;
+      assert(unique);
+      UNUSED(unique);
+    }
+
+    void erase(Alloc* alloc, Object* p)
+    {
+      auto it = external_map->find(p);
+      assert(it != external_map->end());
+      remove_ref(alloc, it);
+    }
+
+    void remove_ref(Alloc* alloc, ExternalMap::Iterator& it)
+    {
+      auto*& ext_ref = it.value();
+      if (ext_ref != nullptr)
+      {
+        // The object this external ref points to has been collected, so we
+        // need to invalidate this ext_ref so that `is_in` returns
+        // false.second.
+        ext_ref->o = nullptr;
+        ext_ref->ert.store(nullptr, std::memory_order_relaxed);
+        Immutable::release(alloc, ext_ref);
+      }
+      external_map->erase(it);
     }
   };
 

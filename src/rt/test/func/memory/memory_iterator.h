@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "memory.h"
@@ -28,8 +28,7 @@ namespace memory_iterator
     Object* t = new (alloc, o) T;
     all.insert(t);
 
-    if constexpr (
-      has_trace_possibly_iso<T>::value || !std::is_trivially_destructible_v<T>)
+    if constexpr (!std::is_trivially_destructible_v<T>)
       non_trivial.insert(t);
     else
       trivial.insert(t);

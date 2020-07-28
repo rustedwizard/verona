@@ -1,7 +1,8 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include "interpreter/vm.h"
 
+#include "interpreter/convert.h"
 #include "interpreter/format.h"
 
 #include <fmt/ranges.h>
@@ -10,36 +11,17 @@ namespace verona::interpreter
 {
   void VM::run(std::vector<Value> args, size_t cown_count, size_t start)
   {
+    assert(cfstack_.empty());
+
     halt_ = false;
-    start_ip_ = ip_ = start;
+    push_frame(start, 0, OnReturn::Halt);
 
-    std::string_view name = code_.str(ip_);
-
-    frame_ = Frame::initial();
-    frame_.argc = code_.u8(ip_);
-    frame_.retc = code_.u8(ip_);
-    frame_.locals = code_.u8(ip_);
-    code_.u32(ip_); // size
-
-    assert(static_cast<size_t>(frame_.argc) == args.size());
-
-    trace(
-      "Entering function {}, argc={:d} retc={:d} locals={:d}",
-      name,
-      frame_.argc,
-      frame_.retc,
-      frame_.locals);
-
-    // Load registers with cowns values.
-    assert(frame_.base == 0);
-
-    // Ensure the stack is large enough.
-    grow_stack(frame_.base + frame_.argc + frame_.locals);
-
-    size_t index = 0;
+    assert(static_cast<size_t>(frame().argc) == args.size());
 
     // First argument is the receiver, followed by cown_count cowns that are
-    // being acquired, followed by captures.
+    // being acquired, followed by captures. The cowns need to be transformed
+    // so we actually pass their contents to the behaviour instead.
+    size_t index = 0;
     for (auto& a : args)
     {
       if (index > 0 && index <= cown_count)
@@ -54,41 +36,89 @@ namespace verona::interpreter
     dispatch_loop();
   }
 
+  void VM::push_frame(size_t ip, size_t base, OnReturn on_return)
+  {
+    FunctionHeader header = code_.function_header(ip);
+
+    start_ip_ = ip;
+    trace(
+      "Calling function {}, base={:d}, argc={:d} retc={:d} locals={:d}",
+      header.name,
+      base,
+      header.argc,
+      header.retc,
+      header.locals);
+
+    Frame frame;
+    frame.ip = ip;
+    frame.argc = header.argc;
+    frame.retc = header.retc;
+    frame.locals = header.locals;
+    frame.base = base;
+    frame.on_return = on_return;
+
+    grow_stack(frame.base + frame.locals);
+    cfstack_.push_back(frame);
+  }
+
   void VM::dispatch_loop()
   {
     while (!halt_)
     {
-      start_ip_ = ip_;
-      Opcode op = code_.opcode(ip_);
+      start_ip_ = frame().ip;
+      Opcode op = code_.opcode(frame().ip);
       dispatch_opcode(op);
     }
   }
 
   void VM::execute_finaliser(VMObject* object)
   {
+    // This function gets called by the runtime to execute a finaliser.
+    // We can't assume much about the VM's state when this is called, and we
+    // must restore anything we might have tampered with.
+    //
+    // For example the finaliser could be called on a running VM as a
+    // consequence of clearing a Register, or it could be called on a halted VM
+    // as a consequence of the scheduler collection a cown.
+
     const VMDescriptor* descriptor = object->descriptor();
     assert(descriptor->finaliser_ip > 0);
 
     auto vm = VM::local_vm;
-    vm->trace("Finaliser for: {}", descriptor->name);
 
-    auto old_halt = vm->halt_;
-    vm->halt_ = false;
+    // Save any VM state that isn't in stacks, and setup the VM into some
+    // reasonable state.
+    bool old_halt = std::exchange(vm->halt_, false);
+    size_t old_start_ip =
+      std::exchange(vm->start_ip_, descriptor->finaliser_ip);
 
-    // Set up a new frame for finaliser
-    vm->write(Register(vm->frame_.locals - 1), Value::mut(object));
-    vm->call(descriptor->finaliser_ip, (uint8_t)1);
+    vm->trace("Running the finaliser for: {}", descriptor->name);
 
-    // Save call stack, so we can jump back into normal execution.
-    auto backup = std::move(vm->cfstack_);
+    // Set up a new frame for the finaliser. The frame starts past the current,
+    // with no overlap, or at zero if there are no executing frames.
+    //
+    // The frame is marked as "halt on return" so we gain back control when the
+    // finaliser is done.
+    size_t base;
+    if (vm->cfstack_.empty())
+      base = 0;
+    else
+      base = vm->frame().base + vm->frame().locals;
 
-    // Run finaliser to completion
+    vm->push_frame(descriptor->finaliser_ip, base, OnReturn::Halt);
+
+    if (vm->frame().argc != 1)
+    {
+      vm->fatal("Finaliser must have one argument, found {}", vm->frame().argc);
+    }
+
+    vm->write(Register(0), Value::mut(object));
+
+    // Run finaliser to completion.
     vm->dispatch_loop();
 
-    // Put back normal execution
-    vm->cfstack_ = std::move(backup);
-    vm->opcode_return();
     vm->halt_ = old_halt;
+    vm->start_ip_ = old_start_ip;
   }
 
   void VM::grow_stack(size_t size)
@@ -100,24 +130,28 @@ namespace verona::interpreter
 
   Value& VM::read(Register reg)
   {
-    if (reg.index >= frame_.locals)
+    if (reg.index >= frame().locals)
+    {
       fatal("Out of bounds stack access (register {})", reg.index);
-    return stack_.at(frame_.base + reg.index);
+    }
+    return stack_.at(frame().base + reg.index);
   }
 
   const Value& VM::read(Register reg) const
   {
-    if (reg.index >= frame_.locals)
+    if (reg.index >= frame().locals)
+    {
       fatal("Out of bounds stack access (register {})", reg.index);
-    return stack_.at(frame_.base + reg.index);
+    }
+    return stack_.at(frame().base + reg.index);
   }
 
   void VM::write(Register reg, Value value)
   {
-    if (reg.index >= frame_.locals)
+    if (reg.index >= frame().locals)
       fatal("Out of bounds stack access (register {})", reg.index);
 
-    stack_.at(frame_.base + reg.index).overwrite(alloc_, std::move(value));
+    stack_.at(frame().base + reg.index).overwrite(alloc_, std::move(value));
   }
 
   const VMDescriptor* VM::find_dispatch_descriptor(Register receiver) const
@@ -161,118 +195,84 @@ namespace verona::interpreter
     }
   }
 
-  void VM::opcode_binop(
-    Register dst,
-    bytecode::BinaryOperator op,
-    const Value& left,
-    const Value& right)
+  Value
+  VM::opcode_binop(bytecode::BinaryOperator op, uint64_t left, uint64_t right)
   {
-    check_type(left, Value::Tag::U64);
-    check_type(right, Value::Tag::U64);
-
-    uint64_t result;
-
     switch (op)
     {
       case bytecode::BinaryOperator::Add:
-        result = left->u64 + right->u64;
-        break;
+        return Value::u64(left + right);
       case bytecode::BinaryOperator::Sub:
-        result = left->u64 - right->u64;
-        break;
+        return Value::u64(left - right);
+      case bytecode::BinaryOperator::Mul:
+        return Value::u64(left * right);
+      case bytecode::BinaryOperator::Div:
+        if (right == 0)
+          fatal("Division by zero");
+        return Value::u64(left / right);
+      case bytecode::BinaryOperator::Mod:
+        if (right == 0)
+          fatal("Division by zero");
+        return Value::u64(left % right);
+      case bytecode::BinaryOperator::Shl:
+        return Value::u64(left << right);
+      case bytecode::BinaryOperator::Shr:
+        return Value::u64(left >> right);
       case bytecode::BinaryOperator::Lt:
-        result = left->u64 < right->u64;
-        break;
+        return Value::u64(left < right);
       case bytecode::BinaryOperator::Gt:
-        result = left->u64 > right->u64;
-        break;
+        return Value::u64(left > right);
       case bytecode::BinaryOperator::Le:
-        result = left->u64 <= right->u64;
-        break;
+        return Value::u64(left <= right);
       case bytecode::BinaryOperator::Ge:
-        result = left->u64 >= right->u64;
-        break;
+        return Value::u64(left >= right);
       case bytecode::BinaryOperator::Eq:
-        result = left->u64 == right->u64;
-        break;
+        return Value::u64(left == right);
       case bytecode::BinaryOperator::Ne:
-        result = left->u64 != right->u64;
-        break;
+        return Value::u64(left != right);
       case bytecode::BinaryOperator::And:
-        result = left->u64 && right->u64;
-        break;
+        return Value::u64(left && right);
       case bytecode::BinaryOperator::Or:
-        result = left->u64 || right->u64;
-        break;
+        return Value::u64(left || right);
 
         EXHAUSTIVE_SWITCH;
     }
-
-    write(dst, Value::u64(result));
   }
 
   void VM::opcode_call(SelectorIdx selector, uint8_t callspace)
   {
     if (callspace == 0)
       fatal("Not enough call space to find a receiver");
-    if (callspace > frame_.locals)
+    if (callspace > frame().locals)
       fatal("Call space does not fit in current frame");
 
     // Dispatch on the receiver, which is the first value in the callspace.
     const VMDescriptor* descriptor =
-      find_dispatch_descriptor(Register(frame_.locals - callspace));
+      find_dispatch_descriptor(Register(frame().locals - callspace));
 
     size_t addr = descriptor->methods[selector];
-    VM::call(addr, callspace);
-  }
+    size_t base = frame().base + frame().locals - callspace;
 
-  void VM::call(size_t addr, uint8_t callspace)
-  {
-    FunctionHeader header = code_.function_header(addr);
+    push_frame(addr, base, OnReturn::Continue);
 
-    if (callspace < header.argc || callspace < header.retc)
+    if (callspace < frame().argc || callspace < frame().retc)
     {
       fatal(
         "Call space is too small: callspace={:d}, argc={:d}, retc={:d}",
         callspace,
-        header.argc,
-        header.retc);
+        frame().argc,
+        frame().retc);
     }
-
-    // End of current frame
-    size_t top = frame_.base + frame_.locals;
-
-    cfstack_.push_back(frame_);
-    indent_++;
-
-    frame_.argc = header.argc;
-    frame_.retc = header.retc;
-    frame_.locals = header.locals;
-    frame_.base = top - callspace;
-    frame_.return_address = ip_;
-
-    // Ensure the stack is large enough.
-    grow_stack(frame_.base + frame_.locals);
-
-    ip_ = addr;
-
-    trace(
-      "Calling function {}, base=r{:d} argc={:d} retc={:d} locals={:d}",
-      header.name,
-      frame_.base,
-      frame_.argc,
-      frame_.retc,
-      frame_.locals);
   }
 
-  void VM::opcode_clear(Register dst)
+  Value VM::opcode_clear()
   {
-    write(dst, Value());
+    return Value();
   }
 
   void VM::opcode_fulfill_sleeping_cown(const Value& cown, Value result)
   {
-    check_type(cown, Value::Tag::COWN);
+    check_type(cown, Value::COWN);
 
     cown->cown->contents = result.consume_iso();
 
@@ -280,63 +280,60 @@ namespace verona::interpreter
     cown->cown->schedule();
   }
 
-  void VM::opcode_freeze(Register dst, Value src)
+  Value VM::opcode_freeze(Value src)
   {
-    check_type(src, Value::Tag::ISO);
+    check_type(src, Value::ISO);
 
     VMObject* contents = src.consume_iso();
     rt::Freeze::apply(alloc_, contents);
-    write(dst, Value::imm(contents));
+    return Value::imm(contents);
   }
 
-  void VM::opcode_copy(Register dst, Value src)
+  Value VM::opcode_copy(Value src)
   {
-    write(dst, std::move(src));
+    return std::move(src);
   }
 
-  void VM::opcode_int64(Register dst, uint64_t imm)
+  Value VM::opcode_int64(uint64_t imm)
   {
-    write(dst, Value::u64(imm));
+    return Value::u64(imm);
   }
 
-  void VM::opcode_string(Register dst, std::string_view imm)
+  Value VM::opcode_string(std::string_view imm)
   {
-    write(dst, Value::string(imm));
+    return Value::string(imm);
   }
 
   void VM::opcode_jump(int16_t offset)
   {
-    ip_ = start_ip_ + offset;
+    frame().ip = start_ip_ + offset;
   }
 
-  void VM::opcode_jump_if(const Value& src, int16_t offset)
+  void VM::opcode_jump_if(uint64_t condition, int16_t offset)
   {
-    check_type(src, Value::Tag::U64);
-
-    if (src->u64 > 0)
-      ip_ = start_ip_ + offset;
+    if (condition > 0)
+      frame().ip = start_ip_ + offset;
   }
 
-  void VM::opcode_load(Register dst, const Value& base, SelectorIdx selector)
+  Value VM::opcode_load(const Value& base, SelectorIdx selector)
   {
-    check_type(base, {Value::Tag::ISO, Value::Tag::MUT, Value::Tag::IMM});
+    check_type(base, {Value::ISO, Value::MUT, Value::IMM});
 
     VMObject* object = base->object;
     const VMDescriptor* descriptor = object->descriptor();
     size_t index = descriptor->fields[selector];
 
     Value value = object->fields[index].read(base.tag);
-    write(dst, std::move(value));
+    return std::move(value);
   }
 
-  void VM::opcode_load_descriptor(Register dst, DescriptorIdx desc_idx)
+  Value VM::opcode_load_descriptor(DescriptorIdx desc_idx)
   {
     const VMDescriptor* descriptor = code_.get_descriptor(desc_idx);
-    write(dst, Value::descriptor(descriptor));
+    return Value::descriptor(descriptor);
   }
 
-  void VM::opcode_match(
-    Register dst, const Value& src, const VMDescriptor* descriptor)
+  Value VM::opcode_match(const Value& src, const VMDescriptor* descriptor)
   {
     uint64_t result;
     switch (src.tag)
@@ -361,109 +358,78 @@ namespace verona::interpreter
 
     trace(" Matching {} against {} = {}", src, descriptor->name, result);
 
-    write(dst, Value::u64(result));
+    return Value::u64(result);
   }
 
-  void VM::opcode_move(Register dst, Register src)
+  Value VM::opcode_move(Register src)
   {
-    write(dst, std::move(read(src)));
+    return std::move(read(src));
   }
 
-  void VM::opcode_mut_view(Register dst, const Value& src)
+  Value VM::opcode_mut_view(const Value& src)
   {
-    check_type(src, {Value::Tag::ISO, Value::Tag::MUT});
+    check_type(src, {Value::ISO, Value::MUT});
 
-    write(dst, Value::mut(src->object));
+    return Value::mut(src->object);
   }
 
-  void VM::opcode_new(
-    Register dst, const Value& parent, const VMDescriptor* descriptor)
+  Value
+  VM::opcode_new_object(const Value& parent, const VMDescriptor* descriptor)
   {
-    check_type(parent, {Value::Tag::ISO, Value::Tag::MUT});
+    check_type(parent, {Value::ISO, Value::MUT});
 
     VMObject* region = parent->object->region();
     rt::Object* object = rt::Region::alloc(alloc_, region, descriptor);
-    write(dst, Value::mut(new (object) VMObject(region)));
+    return Value::mut(new (object) VMObject(region, descriptor));
   }
 
-  void VM::opcode_new_region(Register dst, const VMDescriptor* descriptor)
+  Value VM::opcode_new_region(const VMDescriptor* descriptor)
   {
     // TODO(region): For now, the only kind of region we can create is a trace
     // region. Later, we might need a new bytecode?
     rt::Object* object = rt::RegionTrace::create(alloc_, descriptor);
-    write(dst, Value::iso(new (object) VMObject(nullptr)));
+    return Value::iso(new (object) VMObject(nullptr, descriptor));
   }
 
-  void
-  VM::opcode_new_cown(Register dst, const VMDescriptor* descriptor, Value src)
+  Value VM::opcode_new_cown(const VMDescriptor* descriptor, Value src)
   {
-    check_type(src, Value::Tag::ISO);
+    check_type(src, Value::ISO);
     VMObject* contents = src.consume_iso();
-    write(dst, Value::cown(new VMCown(descriptor, contents)));
+    return Value::cown(new VMCown(descriptor, contents));
   }
 
-  void
-  VM::opcode_new_sleeping_cown(Register dst, const VMDescriptor* descriptor)
+  Value VM::opcode_new_sleeping_cown(const VMDescriptor* descriptor)
   {
     auto a = Value::cown(new VMCown(descriptor));
     trace(" New sleeping cown {}", a);
 
-    write(dst, std::move(a));
+    return std::move(a);
   }
 
   void VM::opcode_trace_region(const Value& object)
   {
-    check_type(object, {Value::Tag::ISO, Value::Tag::MUT});
+    check_type(object, {Value::ISO, Value::MUT});
 
     VMObject* region = object->object->region();
-
     rt::RegionTrace::gc(alloc_, region);
   }
 
-  void VM::opcode_print(const Value& src, uint8_t argc)
+  void VM::opcode_print(std::string_view fmt, uint8_t argc)
   {
-    check_type(src, Value::Tag::STRING);
-    std::string_view format = src->string();
-
-    std::vector<const Value*> values;
+    fmt::dynamic_format_arg_store<fmt::format_context> store;
     for (uint8_t i = 0; i < argc; i++)
     {
-      values.push_back(&read(code_.load<Register>(ip_)));
+      Register reg = code_.load<Register>(frame().ip);
+      store.push_back(std::cref(read(reg)));
     }
-
-    // Sadly fmt doesn't have any public API for dynamic sized lists of
-    // arguments.
-    switch (argc)
-    {
-      case 0:
-        fmt::print(format);
-        break;
-      case 1:
-        fmt::print(format, *values[0]);
-        break;
-      case 2:
-        fmt::print(format, *values[0], *values[1]);
-        break;
-      case 3:
-        fmt::print(format, *values[0], *values[1], *values[2]);
-        break;
-      case 4:
-        fmt::print(format, *values[0], *values[1], *values[2], *values[3]);
-        break;
-      case 5:
-        fmt::print(
-          format, *values[0], *values[1], *values[2], *values[3], *values[4]);
-        break;
-      default:
-        fatal("{} is more arguments than opcode_print can handle", argc);
-    };
+    fmt::vprint(fmt, store);
   }
 
   void VM::opcode_return()
   {
     // Ensure that all registers (except the return values) have been cleared
     // already.
-    for (int i = frame_.retc; i < frame_.locals; i++)
+    for (int i = frame().retc; i < frame().locals; i++)
     {
       Value& value = read(Register(i));
       switch (value.tag)
@@ -485,29 +451,27 @@ namespace verona::interpreter
       }
     }
 
-    if (cfstack_.empty())
+    if (frame().on_return == OnReturn::Halt)
     {
       // We currently never use the return value of the top function, so just
       // clear the return registers.
-      for (int i = frame_.retc; i < frame_.locals; i++)
+      for (int i = frame().retc; i < frame().locals; i++)
       {
         read(Register(i)).clear(alloc_);
       }
 
       halt_ = true;
-      return;
     }
-
-    ip_ = frame_.return_address;
-    frame_ = cfstack_.back();
+    else if (cfstack_.size() < 2)
+    {
+      fatal("Cannot return of top-most frame");
+    }
     cfstack_.pop_back();
-    indent_--;
   }
 
-  void VM::opcode_store(
-    Register dst, const Value& base, SelectorIdx selector, Value src)
+  Value VM::opcode_store(const Value& base, SelectorIdx selector, Value src)
   {
-    check_type(base, {Value::Tag::ISO, Value::Tag::MUT});
+    check_type(base, {Value::ISO, Value::MUT});
 
     VMObject* object = base->object;
     const VMDescriptor* desc = object->descriptor();
@@ -520,7 +484,7 @@ namespace verona::interpreter
 
     Value old_value =
       object->fields[index].exchange(alloc_, object->region(), std::move(src));
-    write(dst, std::move(old_value));
+    return std::move(old_value);
   }
 
   void VM::opcode_when(
@@ -529,7 +493,7 @@ namespace verona::interpreter
     // One added for unused receiver
     // TODO-Better-Static-codegen
     auto callspace = cown_count + capture_count + 1;
-    if (callspace > frame_.locals)
+    if (callspace > frame().locals)
       fatal("Call space does not fit in current frame");
 
     size_t entry_addr = closure_body;
@@ -544,7 +508,7 @@ namespace verona::interpreter
         header.argc);
     }
 
-    size_t top = frame_.base + frame_.locals;
+    size_t top = frame().base + frame().locals;
     Value* values = &stack_[top - callspace + 1];
 
     // Prepare the cowns and the arguments for the method invocation.
@@ -561,7 +525,7 @@ namespace verona::interpreter
     {
       Value& v = values[i];
       trace("Capturing cown {:d}: {}", i, v);
-      check_type(v, Value::Tag::COWN);
+      check_type(v, Value::COWN);
 
       // Multimessage will take increfs on all the cowns, so don't need to
       // protect them here.
@@ -581,7 +545,7 @@ namespace verona::interpreter
     }
 
     trace(
-      "Dispatching when to function {}, argc={:d}", header.name, frame_.argc);
+      "Dispatching when to function {}, argc={:d}", header.name, header.argc);
 
     // If no cowns create a fake one to run the code on.
     if (cowns.size() == 0)
@@ -604,7 +568,7 @@ namespace verona::interpreter
     {
 #define OP(NAME, FN) \
   case Opcode::NAME: \
-    execute_opcode<Opcode::NAME, &VM::FN>(ip_); \
+    execute_opcode<Opcode::NAME, &VM::FN>(frame().ip); \
     break;
 
       OP(BinOp, opcode_binop);
@@ -621,7 +585,7 @@ namespace verona::interpreter
       OP(Match, opcode_match);
       OP(Move, opcode_move);
       OP(MutView, opcode_mut_view);
-      OP(New, opcode_new);
+      OP(NewObject, opcode_new_object);
       OP(NewRegion, opcode_new_region);
       OP(NewSleepingCown, opcode_new_sleeping_cown);
       OP(NewCown, opcode_new_cown);
@@ -646,18 +610,14 @@ namespace verona::interpreter
     static_assert(std::is_member_function_pointer_v<decltype(Fn)>);
 
     auto operands = code_.load_operands<opcode>(ip);
+
+    // The std::apply with a lambda trick turns the operands tuple into a
+    // parameter pack, so it can more easily be used.
     std::apply(
       [&](const auto&... args) {
         this->trace(bytecode::OpcodeSpec<opcode>::format, args...);
+        execute_handler<decltype(Fn)>::template execute<Fn>(this, args...);
       },
       operands);
-
-    auto arguments =
-      convert_operand_list<decltype(Fn)>::convert(this, operands);
-    std::apply(
-      [&](auto&&... args) {
-        (this->*Fn)(std::forward<decltype(args)>(args)...);
-      },
-      std::move(arguments));
   }
 }

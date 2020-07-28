@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include <test/harness.h>
 #include <test/log.h>
 #include <test/opt.h>
@@ -45,10 +45,10 @@ void test_multimessage(size_t cores)
       logger::cout() << "result = " << (a->i + b->i) << std::endl;
     }
 
-    void trace(ObjectStack* st) const
+    void trace(ObjectStack& st) const
     {
-      st->push(a);
-      st->push(b);
+      st.push(a);
+      st.push(b);
     }
   };
 

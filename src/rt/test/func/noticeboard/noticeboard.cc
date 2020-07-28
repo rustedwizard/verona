@@ -1,5 +1,6 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
+
 #include "./noticeboard_basic.h"
 #include "./noticeboard_primitive_weak.h"
 #include "./noticeboard_weak.h"

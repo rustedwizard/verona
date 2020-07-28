@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include "compiler/codegen/function.h"
 #include "compiler/ir/ir.h"
 #include "compiler/printing.h"
@@ -179,7 +179,7 @@ namespace verona::compiler
       if (stmt.parent)
       {
         Register parent = variable(*stmt.parent);
-        gen_.opcode(Opcode::New);
+        gen_.opcode(Opcode::NewObject);
         gen_.reg(output);
         gen_.reg(parent);
         gen_.reg(descriptor);

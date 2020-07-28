@@ -1,9 +1,10 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <ostream>
 #include <string_view>
 
@@ -163,7 +164,7 @@ namespace verona::bytecode
     Merge, // into(u8), src(u8)
     Move, // dst(u8), src(u8)
     MutView, // dst(u8), src(u8)
-    New, // dst(u8), region(u8), descriptor(u8)
+    NewObject, // dst(u8), region(u8), descriptor(u8)
     NewCown, // dst(u8), descriptor(u8), src(u8)
     NewRegion, // dst(u8), descriptor(u8)
     NewSleepingCown, // dst(u8), descriptor(u8)
@@ -181,6 +182,11 @@ namespace verona::bytecode
   {
     Add,
     Sub,
+    Mul,
+    Div,
+    Mod,
+    Shl,
+    Shr,
     Lt,
     Le,
     Gt,
@@ -305,10 +311,10 @@ namespace verona::bytecode
   };
 
   template<>
-  struct OpcodeSpec<Opcode::New>
+  struct OpcodeSpec<Opcode::NewObject>
   {
     using Operands = OpcodeOperands<Register, Register, Register>;
-    constexpr static std::string_view format = "NEW {}, {}, {}";
+    constexpr static std::string_view format = "NEW_OBJECT {}, {}, {}";
   };
 
   template<>

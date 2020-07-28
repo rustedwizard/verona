@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include <verona.h>
 
 using namespace snmalloc;
@@ -44,12 +44,12 @@ namespace ext_ref_basic
       ext_node_alias = ExternalRef::create(region, node);
     }
 
-    void trace(ObjectStack* st) const
+    void trace(ObjectStack& st) const
     {
       assert(ext_node);
-      st->push(ext_node);
+      st.push(ext_node);
       assert(ext_node_alias);
-      st->push(ext_node_alias);
+      st.push(ext_node_alias);
     }
   };
 
@@ -102,10 +102,10 @@ namespace ext_ref_basic
 
     A(DList* list_) : list{list_} {}
 
-    void trace(ObjectStack* st) const
+    void trace(ObjectStack& st) const
     {
       assert(list);
-      st->push(list);
+      st.push(list);
     }
   };
 

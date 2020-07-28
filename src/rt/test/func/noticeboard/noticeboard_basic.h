@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include <test/harness.h>
 
 namespace noticeboard_basic
@@ -12,7 +12,14 @@ namespace noticeboard_basic
 
   struct Ping : public VAction<Ping>
   {
-    void f() {}
+    void* target;
+
+    Ping(void* t) : target(t) {}
+
+    void f()
+    {
+      Systematic::cout() << "Ping on " << target << std::endl;
+    }
   };
 
   struct C : public V<C>
@@ -24,12 +31,12 @@ namespace noticeboard_basic
 
     C(int x_) : x(x_) {}
 
-    void trace(ObjectStack* st) const
+    void trace(ObjectStack& st) const
     {
       if (next != nullptr)
-        st->push(next);
+        st.push(next);
       if (alive != nullptr)
-        st->push(alive);
+        st.push(alive);
     }
   };
 
@@ -42,12 +49,12 @@ namespace noticeboard_basic
 
     DB(Object* c) : box{c}
     {
-#ifdef USE_SYSTEMATIC_TESTING
+#ifdef USE_SYSTEMATIC_TESTING_WEAK_NOTICEBOARDS
       register_noticeboard(&box);
 #endif
     }
 
-    void trace(ObjectStack* fields) const
+    void trace(ObjectStack& fields) const
     {
       box.trace(fields);
     }
@@ -75,14 +82,14 @@ namespace noticeboard_basic
 
     Peeker(DB* db_, Noticeboard<Object*>* box_) : db(db_), box(box_) {}
 
-    void trace(ObjectStack* fields) const
+    void trace(ObjectStack& fields) const
     {
       if (alive != nullptr)
       {
-        fields->push(alive);
+        fields.push(alive);
       }
       assert(db);
-      fields->push(db);
+      fields.push(db);
     }
   };
 
@@ -97,6 +104,9 @@ namespace noticeboard_basic
       if (db->n == 30)
       {
         C* new_c = new (alloc) C(1);
+
+        Systematic::cout() << "Update DB Create C " << new_c << std::endl;
+
         Freeze::apply(alloc, new_c);
         db->box.update(alloc, new_c);
       }
@@ -175,7 +185,7 @@ namespace noticeboard_basic
         }
         case USEALIVE:
         {
-          Cown::schedule<Ping>(peeker->alive);
+          Cown::schedule<Ping>(peeker->alive, peeker->alive);
           peeker->state = EXIT;
           Cown::schedule<ToPeek>(peeker, peeker);
           return;
@@ -193,21 +203,30 @@ namespace noticeboard_basic
   {
     Alloc* alloc = ThreadAlloc::get();
 
-    Alive* alive = new Alive;
+    Alive* alive = new (alloc) Alive;
+    Systematic::cout() << "Alive" << alive << std::endl;
 
     C* c = new (alloc) C(0);
     c->next = new (alloc) C(10);
 
     RegionTrace::insert(alloc, c, alive);
     c->alive = alive;
+    Systematic::cout() << "Create C " << c << " with alive " << alive
+                       << std::endl;
+
+    Systematic::cout() << "Create C next" << c->next << std::endl;
 
     Freeze::apply(alloc, c);
 
     DB* db = new DB(c);
+    Systematic::cout() << "DB " << db << std::endl;
+
     Peeker* peeker = new Peeker(db, &db->box);
 
+    Systematic::cout() << "Peeker " << peeker << std::endl;
+
     Cown::schedule<ToPeek>(peeker, peeker);
-    Cown::schedule<Ping>(alive);
+    Cown::schedule<Ping>(alive, alive);
 
     Cown::release(alloc, alive);
     Cown::release(alloc, peeker);

@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "region.h"
@@ -139,6 +139,7 @@ namespace verona::rt
       ObjectStack dfs(alloc);
       ObjectStack iso(alloc);
       ObjectStack pending(alloc);
+      ObjectStack dealloc_regions(alloc);
 
       iso.push(o);
 
@@ -235,6 +236,8 @@ namespace verona::rt
             case Object::RC:
             case Object::COWN:
             {
+              Systematic::cout()
+                << "External reference during freeze: " << r << std::endl;
               // External reference
               r->incref();
               break;
@@ -284,8 +287,17 @@ namespace verona::rt
 
               assert(p != reg);
 
-              p->finalise();
+              // ISO marker has been dropped on entry point, so
+              // can pass nullptr here.
+              p->finalise(nullptr, dealloc_regions);
               to_dealloc.push(p);
+              // Deallocate unreachable sub-regions
+              while (!dealloc_regions.empty())
+              {
+                Object* q = dealloc_regions.pop();
+                Region::release(alloc, q);
+              }
+
               p = next;
               continue;
             }

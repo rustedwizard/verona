@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "interpreter/code.h"
@@ -52,41 +52,48 @@ namespace verona::interpreter
     static void execute_finaliser(VMObject* object);
 
   private:
-    void opcode_binop(
-      Register dst,
-      bytecode::BinaryOperator op,
-      const Value& left,
-      const Value& right);
+    Value
+    opcode_binop(bytecode::BinaryOperator op, uint64_t left, uint64_t right);
     void opcode_call(SelectorIdx selector, uint8_t callspace);
-    void call(size_t addr, uint8_t callspace);
-    void opcode_clear(Register dst);
-    void opcode_copy(Register dst, Value src);
+    Value opcode_clear();
+    Value opcode_copy(Value src);
     void opcode_fulfill_sleeping_cown(const Value& cown, Value result);
-    void opcode_freeze(Register dst, Value src);
-    void opcode_int64(Register dst, uint64_t imm);
+    Value opcode_freeze(Value src);
+    Value opcode_int64(uint64_t imm);
     void opcode_jump(int16_t offset);
-    void opcode_jump_if(const Value& src, int16_t offset);
-    void opcode_load(Register dst, const Value& base, SelectorIdx selector);
-    void opcode_load_descriptor(Register dst, DescriptorIdx desc_idx);
-    void opcode_match(
-      Register dst, const Value& src, const VMDescriptor* descriptor);
-    void opcode_move(Register dst, Register src);
-    void opcode_mut_view(Register dst, const Value& src);
-    void opcode_new(
-      Register dst, const Value& parent, const VMDescriptor* descriptor);
-    void opcode_new_region(Register dst, const VMDescriptor* descriptor);
-    void
-    opcode_new_cown(Register dst, const VMDescriptor* descriptor, Value src);
-    void opcode_new_sleeping_cown(Register dst, const VMDescriptor* descriptor);
-    void opcode_print(const Value& src, uint8_t argc);
+    void opcode_jump_if(uint64_t condition, int16_t offset);
+    Value opcode_load(const Value& base, SelectorIdx selector);
+    Value opcode_load_descriptor(DescriptorIdx desc_idx);
+    Value opcode_match(const Value& src, const VMDescriptor* descriptor);
+    Value opcode_move(Register src);
+    Value opcode_mut_view(const Value& src);
+    Value
+    opcode_new_object(const Value& parent, const VMDescriptor* descriptor);
+    Value opcode_new_region(const VMDescriptor* descriptor);
+    Value opcode_new_cown(const VMDescriptor* descriptor, Value src);
+    Value opcode_new_sleeping_cown(const VMDescriptor* descriptor);
+    void opcode_print(std::string_view fmt, uint8_t argc);
     void opcode_return();
-    void opcode_store(
-      Register dst, const Value& base, SelectorIdx selector, Value src);
-    void opcode_string(Register dst, std::string_view imm);
+    Value opcode_store(const Value& base, SelectorIdx selector, Value src);
+    Value opcode_string(std::string_view imm);
     void opcode_trace_region(const Value& region);
     void
     opcode_when(CodePtr selector, uint8_t cown_count, uint8_t capture_count);
     void opcode_unreachable();
+
+    enum class OnReturn
+    {
+      Halt,
+      Continue,
+    };
+
+    /**
+     * Setup a new frame for execution.
+     *
+     * The frame is added to the control flow stack, and the register stack is
+     * grown to be big enough to execute this frame.
+     */
+    void push_frame(size_t ip, size_t base, OnReturn on_return);
 
     /**
      * Switches on the opcode value and invokes the appropriate handler.
@@ -133,7 +140,8 @@ namespace verona::interpreter
     {
       if (verbose_)
       {
-        fmt::print(std::cerr, "[{:4x}]: {:<{}}", start_ip_, "", indent_);
+        size_t indent = cfstack_.empty() ? 0 : cfstack_.size() - 1;
+        fmt::print(std::cerr, "[{:4x}]: {:<{}}", start_ip_, "", indent);
         fmt::print(std::cerr, fmt, std::forward<Args>(args)...);
         fmt::print(std::cerr, "\n");
       }
@@ -142,7 +150,8 @@ namespace verona::interpreter
     template<typename... Args>
     [[noreturn]] void fatal(std::string_view fmt, Args&&... args) const
     {
-      fmt::print(std::cerr, "[{:4x}]: {:<{}}FATAL: ", start_ip_, "", indent_);
+      size_t indent = cfstack_.empty() ? 0 : cfstack_.size() - 1;
+      fmt::print(std::cerr, "[{:4x}]: {:<{}}FATAL: ", start_ip_, "", indent);
       fmt::print(std::cerr, fmt, std::forward<Args>(args)...);
       fmt::print(std::cerr, "\n");
       abort();
@@ -152,20 +161,16 @@ namespace verona::interpreter
     void check_type(const Value& value, std::vector<Value::Tag> expected);
 
     const Code& code_;
-    rt::Alloc* alloc_;
-    bool verbose_;
-
-    /**
-     * Instruction Pointer
-     */
-    size_t ip_;
+    rt::Alloc* const alloc_;
+    const bool verbose_;
 
     /**
      * Address of the currently executing instruction.
      *
-     * After an instruction is parsed, ip_ points to the start of the next
-     * instruction. start_ip_ is used for tracing, and to resolve relative
+     * After an instruction is parsed, frame().ip points to the start of the
+     * next instruction. start_ip_ is used for tracing, and to resolve relative
      * offsets.
+     *
      */
     size_t start_ip_;
 
@@ -188,16 +193,19 @@ namespace verona::interpreter
     struct Frame
     {
       /**
-       * Address to which execution returns when exiting this frame.
+       * Bytecode offset at which instruction data is fetched.
        *
-       * This is unused in the lowest frame, as exiting that frame halts the VM.
+       * This value changes as operands get parsed from the bytecode. This means
+       * during execution of an opcode, it actually points to the next
+       * instruction. start_ip_ should be used to get the offset of the
+       * currently executing instruction.
        */
-      size_t return_address;
+      size_t ip;
 
       /**
        * Base offset into the value stack.
        *
-       * All register accesses are relative the the current frame's base
+       * All register accesses are relative to the current frame's base
        */
       size_t base;
 
@@ -212,133 +220,38 @@ namespace verona::interpreter
       uint8_t argc;
       uint8_t retc;
 
-      static Frame initial()
-      {
-        return Frame{0, 0, 0, 0, 0};
-      }
+      /**
+       * Determine the behaviour of the RETURN opcode within this frame.
+       * If Halt, it will pop the frame and halt execution. If Continue,
+       * it will pop the frame and continue executing the previous one.
+       */
+      OnReturn on_return;
     };
-
-    /**
-     * Current frame.
-     */
-    Frame frame_;
 
     /**
      * Call stack.
      *
-     * On CALL, the current frame is pushed on here, and on RETURN the top of
-     * the stack is popped and becomes the current frame.
+     * On CALL, a new frame is push on here, and on RETURN the top of
+     * the stack is popped, restoring the previous state.
      */
     std::vector<Frame> cfstack_;
 
-    /**
-     * Ident level for tracing
-     **/
-    size_t indent_ = 0;
+    Frame& frame()
+    {
+      assert(!cfstack_.empty());
+      return cfstack_.back();
+    }
 
-    /**
-     * Helper type used to convert a single operand.
-     *
-     * The class should be instantiated using the opcode handler method's
-     * argument type. Every specialization of this class provides a method with
-     * the following signature:
-     *
-     *     static T convert(VM*, U operand)
-     *
-     * Where U is the type of the argument as described in the opcode's spec.
-     *
-     * For example there is a convert_operand<Value> specialization,
-     * which provides a `static Value convert(VM*, Register)` method. This
-     * allows loading of registers to be omitted from handler's bodies, by
-     * making them accept a Value argument directly.
-     */
+    const Frame& frame() const
+    {
+      assert(!cfstack_.empty());
+      return cfstack_.back();
+    }
+
     template<typename T>
-    struct convert_operand;
-
-    /**
-     * Helper type extending convert_operand to a list of operands.
-     *
-     * This class should be instantiated using the type of the member function
-     * pointer to an opcode handler, such as `void (VM::*)(Register, Value)`.
-     *
-     * It provides the following method:
-     *
-     *     template<Ts...>
-     *     static tuple<...> convert(VM*, tuple<Ts...> operands)
-     *
-     * Where the argument tuple matches the opcode's spec, and the return tuple
-     * matches the opcode handler's argument types.
-     */
-    template<typename Fn>
-    struct convert_operand_list;
-    template<typename... Args>
-    struct convert_operand_list<void (VM::*)(Args...)>
-    {
-      template<typename... Ts>
-      static std::tuple<Args...> convert(VM* vm, std::tuple<Ts...> operands)
-      {
-        return std::apply(
-          [&](auto... operands) -> std::tuple<Args...> {
-            return {convert_operand<Args>::convert(vm, operands)...};
-          },
-          operands);
-      }
-    };
-  };
-
-  /**
-   * Blanket identity conversion on operands, for any type.
-   */
-  template<typename T>
-  struct VM::convert_operand
-  {
-    static T convert(VM* vm, T value)
-    {
-      return value;
-    }
-  };
-
-  /**
-   * Operand conversion from a Register to a Value, which might consume the
-   * underlying register. The opcode handler receives ownership of the Value and
-   * must use it or clear it before exiting.
-   */
-  template<>
-  struct VM::convert_operand<Value>
-  {
-    static Value convert(VM* vm, Register reg)
-    {
-      return vm->read(reg).maybe_consume();
-    }
-  };
-
-  /**
-   * Operand conversion from a Register to a borrowed Value.
-   */
-  template<>
-  struct VM::convert_operand<const Value&>
-  {
-    static const Value& convert(VM* vm, Register reg)
-    {
-      return vm->read(reg);
-    }
-  };
-
-  /**
-   * Operand conversion from a Register to a VMDescriptor.
-   *
-   * This conversion loads the register, assuming it has tag DESCRIPTOR, and
-   * returns its contents.
-   */
-  template<>
-  struct VM::convert_operand<const VMDescriptor*>
-  {
-    static const VMDescriptor* convert(VM* vm, Register reg)
-    {
-      const Value& value = vm->read(reg);
-      vm->check_type(value, Value::Tag::DESCRIPTOR);
-      return value->descriptor;
-    }
+    friend struct convert_operand;
+    template<typename T>
+    friend struct execute_handler;
   };
 
   /**

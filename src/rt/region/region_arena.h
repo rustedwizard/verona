@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "../object/object.h"
@@ -233,7 +233,10 @@ namespace verona::rt
     Object* last_large;
 
     RegionArena()
-    : first_arena(nullptr), last_arena(nullptr), last_large(nullptr)
+    : RegionBase(desc()),
+      first_arena(nullptr),
+      last_arena(nullptr),
+      last_large(nullptr)
     {
       set_descriptor(desc());
       init_next(this);
@@ -534,8 +537,7 @@ namespace verona::rt
      *
      * Note: this does not release subregions. Use Region::release instead.
      **/
-    void release_internal(
-      Alloc* alloc, Object* o, ObjectStack& f, ObjectStack& collect)
+    void release_internal(Alloc* alloc, Object* o, ObjectStack& collect)
     {
       assert(o->debug_is_iso());
       // Don't trace or finalise o, we'll do it when looping over the large
@@ -545,16 +547,20 @@ namespace verona::rt
 
       // Clean up all the non-trivial objects, by running the finaliser and
       // destructor, and collecting iso regions.
-      //
-      // This must be done in two passes, as one object's finaliser may read
-      // another object's fields, or even extract sub-regions from it.
+      // Finalisers must provide all the isos of the current object that will
+      // need collecting.  The language must guarantee that there are no isos
+      // left in this object that haven't been added to collect.  Read-only
+      // views of objects during finalization are the easiest way to guarantee
+      // this.
       for (auto it = begin<NonTrivial>(); it != end<NonTrivial>(); ++it)
       {
-        (*it)->finalise();
+        (*it)->finalise(o, collect);
       }
+
+      // Destructors can invalidate the object's state, so all finalisers must
+      // run before any destructor runs, i.e. two separate passes are required.
       for (auto it = begin<NonTrivial>(); it != end<NonTrivial>(); ++it)
       {
-        (*it)->find_iso_fields(o, f, collect);
         (*it)->destructor();
       }
 
@@ -577,7 +583,7 @@ namespace verona::rt
       }
 
       // Sweep the RememberedSet, to ensure destructors are called.
-      hash_set->sweep_set(alloc, 0);
+      RememberedSet::sweep(alloc);
 
       // Deallocate RegionArena
       // Don't need to deallocate `o`, since it was part of the arena or ring.

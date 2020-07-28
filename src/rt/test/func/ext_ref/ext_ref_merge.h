@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include <verona.h>
 
 using namespace snmalloc;
@@ -11,10 +11,10 @@ namespace ext_ref_merge
   struct C : public V<C<region_type>, region_type>
   {
     C* f1 = nullptr;
-    void trace(ObjectStack* st) const
+    void trace(ObjectStack& st) const
     {
       if (f1 != nullptr)
-        st->push(f1);
+        st.push(f1);
     }
   };
 

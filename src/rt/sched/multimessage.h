@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "../ds/mpscq.h"
@@ -37,7 +37,7 @@ namespace verona::rt
     static MultiMessage*
     make(Alloc* alloc, EpochMark epoch, MultiMessageBody* body)
     {
-      auto msg = (MultiMessage*)alloc->alloc(sizeof(MultiMessage));
+      auto msg = (MultiMessage*)alloc->alloc<sizeof(MultiMessage)>();
       msg->body = body;
       msg->set_epoch(epoch);
       return msg;

@@ -1,0 +1,14 @@
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
+
+f()
+{
+  let int1 = 00_42;
+  let int2 = 0xc0_FFeE;
+  let int3 = 0b10_10_10;
+  let float1 = 27.18e-1;
+  let precedence1 = 1 + 2 + 3;
+  let precedence2 = 1 + (2 + 3);
+  let object1 = new { x : U64 = 0; };
+  let object2 = new Foo { x : U64 = 0; };
+}

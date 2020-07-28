@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 namespace notify_interleave
 {
   struct Ping : public VAction<Ping>
@@ -35,10 +35,10 @@ namespace notify_interleave
 
     B(A* a_) : a{a_} {}
 
-    void trace(ObjectStack* st) const
+    void trace(ObjectStack& st) const
     {
       assert(a);
-      st->push(a);
+      st.push(a);
     }
   };
 

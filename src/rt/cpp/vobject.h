@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "../region/region.h"
@@ -20,15 +20,6 @@ namespace verona::rt
   //
   // This is better than ignoring methods with the right name but the wrong
   // signature.
-  template<class T, class = void>
-  struct has_trace_possibly_iso : std::false_type
-  {};
-  template<class T>
-  struct has_trace_possibly_iso<
-    T,
-    std::void_t<decltype(&T::trace_possibly_iso)>> : std::true_type
-  {};
-
   template<class T, class = void>
   struct has_notified : std::false_type
   {};
@@ -66,15 +57,9 @@ namespace verona::rt
 
     using RegionClass = typename RegionType_to_class<region_type>::T;
 
-    static void gc_trace(const Object* o, ObjectStack* st)
+    static void gc_trace(const Object* o, ObjectStack& st)
     {
       ((T*)o)->trace(st);
-    }
-
-    static void gc_trace_possibly_iso(const Object* o, ObjectStack* st)
-    {
-      if constexpr (has_trace_possibly_iso<T>::value)
-        ((T*)o)->trace_possibly_iso(st);
     }
 
     static void gc_notified(Object* o)
@@ -83,10 +68,10 @@ namespace verona::rt
         ((T*)o)->notified(o);
     }
 
-    static void gc_final(Object* o)
+    static void gc_final(Object* o, Object* region, ObjectStack& sub_regions)
     {
       if constexpr (has_finaliser<T>::value)
-        ((T*)o)->finaliser();
+        ((T*)o)->finaliser(region, sub_regions);
     }
 
     static void gc_destructor(Object* o)
@@ -99,7 +84,6 @@ namespace verona::rt
       static constexpr Descriptor desc = {
         sizeof(T),
         gc_trace,
-        has_trace_possibly_iso<T>::value ? gc_trace_possibly_iso : nullptr,
         has_finaliser<T>::value ? gc_final : nullptr,
         has_notified<T>::value ? gc_notified : nullptr,
         has_destructor<T>::value ? gc_destructor : nullptr};
@@ -107,7 +91,7 @@ namespace verona::rt
       return &desc;
     }
 
-    void trace(ObjectStack*) {}
+    void trace(ObjectStack&) {}
 
     static EpochMark get_alloc_epoch()
     {
@@ -115,14 +99,15 @@ namespace verona::rt
     }
 
   public:
+    V() : Base(desc()) {}
+
     void* operator new(size_t)
     {
       if constexpr (std::is_same_v<Base, Object>)
         return RegionClass::template create<sizeof(T)>(
           ThreadAlloc::get(), desc());
       else
-        return Cown::alloc<sizeof(T)>(
-          ThreadAlloc::get(), desc(), get_alloc_epoch());
+        return ThreadAlloc::get()->alloc<sizeof(T)>();
     }
 
     void* operator new(size_t, Alloc* alloc)
@@ -130,7 +115,7 @@ namespace verona::rt
       if constexpr (std::is_same_v<Base, Object>)
         return RegionClass::template create<sizeof(T)>(alloc, desc());
       else
-        return Cown::alloc<sizeof(T)>(alloc, desc(), get_alloc_epoch());
+        return alloc->alloc<sizeof(T)>();
     }
 
     void* operator new(size_t, Object* region)
@@ -139,8 +124,7 @@ namespace verona::rt
         return RegionClass::template alloc<sizeof(T)>(
           ThreadAlloc::get(), region, desc());
       else
-        return Cown::alloc<sizeof(T)>(
-          ThreadAlloc::get(), desc(), get_alloc_epoch());
+        return ThreadAlloc::get()->alloc<sizeof(T)>();
     }
 
     void* operator new(size_t, Alloc* alloc, Object* region)
@@ -148,7 +132,7 @@ namespace verona::rt
       if constexpr (std::is_same_v<Base, Object>)
         return RegionClass::template alloc<sizeof(T)>(alloc, region, desc());
       else
-        return Cown::alloc<sizeof(T)>(alloc, desc(), get_alloc_epoch());
+        return alloc->alloc<sizeof(T)>();
     }
 
     void operator delete(void*)

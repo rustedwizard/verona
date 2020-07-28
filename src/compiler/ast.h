@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "compiler/context.h"
@@ -555,6 +555,11 @@ namespace verona::compiler
   {
     Add,
     Sub,
+    Mul,
+    Div,
+    Mod,
+    Shl,
+    Shr,
     Lt,
     Le,
     Gt,

@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "../sched/action.h"
@@ -27,7 +27,7 @@ namespace verona::rt
     friend class Cown;
 
   private:
-    static void gc_trace(const Action* msg, ObjectStack* st)
+    static void gc_trace(const Action* msg, ObjectStack& st)
     {
       (static_cast<const T*>(msg))->trace(st);
     }
@@ -51,7 +51,7 @@ namespace verona::rt
       return &desc;
     }
 
-    void trace(ObjectStack*) const {}
+    void trace(ObjectStack&) const {}
 
   public:
     VAction() : Action(desc())

@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 namespace notify_coalesce
 {
   static size_t g_called;
@@ -37,10 +37,10 @@ namespace notify_coalesce
 
     B(A* a_) : a{a_} {}
 
-    void trace(ObjectStack* st) const
+    void trace(ObjectStack& st) const
     {
       assert(a);
-      st->push(a);
+      st.push(a);
     }
   };
 

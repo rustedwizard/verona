@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include "interpreter/bytecode.h"
 
 #include "ds/helpers.h"
@@ -23,6 +23,21 @@ namespace verona::bytecode
         break;
       case BinaryOperator::Sub:
         fmt::print(out, "SUB");
+        break;
+      case BinaryOperator::Mul:
+        fmt::print(out, "MUL");
+        break;
+      case BinaryOperator::Div:
+        fmt::print(out, "DIV");
+        break;
+      case BinaryOperator::Mod:
+        fmt::print(out, "MOD");
+        break;
+      case BinaryOperator::Shl:
+        fmt::print(out, "SHL");
+        break;
+      case BinaryOperator::Shr:
+        fmt::print(out, "SHR");
         break;
       case BinaryOperator::Lt:
         fmt::print(out, "LT");

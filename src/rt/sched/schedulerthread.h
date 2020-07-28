@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "../object/object.h"
@@ -19,6 +19,7 @@ namespace verona::rt
   public:
     /// Friendly thread identifier for logging information.
     size_t systematic_id = 0;
+    size_t systematic_speed_mask = 1;
 
   private:
     using Scheduler = ThreadPool<SchedulerThread<T>>;
@@ -90,7 +91,7 @@ namespace verona::rt
 
     SchedulerThread() : token_cown{T::create_token_cown()}, q{token_cown}
     {
-      token_cown->thread = this;
+      token_cown->set_owning_thread(this);
     }
 
     ~SchedulerThread()
@@ -123,7 +124,7 @@ namespace verona::rt
         scheduled_unscanned_cown = true;
       }
       assert(!a->queue.is_sleeping());
-      q.push(alloc, a);
+      q.enqueue(alloc, a);
 
       // Put the token back if it has been stolen.  This will help
       // free up more work for other threads to steal.
@@ -139,7 +140,7 @@ namespace verona::rt
       // asynchronous I/O.
       Systematic::cout() << "LIFO Scheduled Cown: " << a << std::endl;
 
-      q.push_back(ThreadAlloc::get(), a);
+      q.enqueue_front(ThreadAlloc::get(), a);
       stats.lifo();
 
       if (Scheduler::get().unpause())
@@ -217,7 +218,7 @@ namespace verona::rt
 
         if (cown == nullptr)
         {
-          cown = q.pop(alloc);
+          cown = q.dequeue(alloc);
           if (cown != nullptr)
             Systematic::cout() << "Popped cown:" << cown << std::endl;
         }
@@ -274,7 +275,7 @@ namespace verona::rt
             // otherwise run this cown again. Don't push to the queue
             // immediately to avoid another thread stealing our only cown.
 
-            T* n = q.pop(alloc);
+            T* n = q.dequeue(alloc);
 
             if (n != nullptr)
             {
@@ -319,11 +320,8 @@ namespace verona::rt
       cown = list;
       while (cown != nullptr)
       {
-        if (cown->thread.load(std::memory_order_relaxed) != nullptr)
-        {
+        if (!cown->is_collected())
           cown->collect(alloc);
-          cown->thread.store(nullptr, std::memory_order_relaxed);
-        }
         cown = cown->next;
       }
 
@@ -336,7 +334,7 @@ namespace verona::rt
 
       GlobalEpoch::advance();
 
-      collect_cown_stubs();
+      collect_cown_stubs<true>();
 
       Systematic::cout() << "End teardown (phase 2)" << std::endl;
 
@@ -351,7 +349,7 @@ namespace verona::rt
       // Try to steal from the victim thread.
       if (victim != this)
       {
-        cown = victim->q.pop(alloc);
+        cown = victim->q.dequeue(alloc);
 
         if (cown != nullptr)
         {
@@ -415,7 +413,7 @@ namespace verona::rt
         ld_protocol();
 
         // Check if some other thread has pushed work on our queue.
-        cown = q.pop(alloc);
+        cown = q.dequeue(alloc);
 
         if (cown != nullptr)
           return cown;
@@ -423,7 +421,7 @@ namespace verona::rt
         // Try to steal from the victim thread.
         if (victim != this)
         {
-          cown = victim->q.pop(alloc);
+          cown = victim->q.dequeue(alloc);
 
           if (cown != nullptr)
           {
@@ -495,8 +493,7 @@ namespace verona::rt
       if (has_thread_bit(cown))
       {
         auto unmasked = clear_thread_bit(cown);
-        SchedulerThread* sched =
-          unmasked->thread.load(std::memory_order_relaxed);
+        SchedulerThread* sched = unmasked->owning_thread();
         assert(!sched->debug_is_token_consumed());
         sched->set_token_consumed(true);
 
@@ -515,9 +512,11 @@ namespace verona::rt
 
       // Register this cown with the scheduler thread if it is not currently
       // registered with a scheduler thread.
-      if (cown->thread.load(std::memory_order::memory_order_relaxed) == nullptr)
+      if (cown->owning_thread() == nullptr)
       {
-        cown->thread.store(this, std::memory_order::memory_order_relaxed);
+        Systematic::cout() << "Bind cown " << this << " to scheduler thread."
+                           << std::endl;
+        cown->set_owning_thread(this);
         cown->next = list;
         list = cown;
         total_cowns++;
@@ -580,7 +579,6 @@ namespace verona::rt
         // systematic testing.
         yield();
         ThreadState::State snext = Scheduler::get().next_state(sprev);
-        yield();
 
         // If we have a lost wake-up, then all threads can get stuck
         // trying to perform a LD.
@@ -593,6 +591,7 @@ namespace verona::rt
 
         if (snext == sprev)
           return;
+        yield();
 
         if (first)
         {
@@ -686,7 +685,7 @@ namespace verona::rt
     {
       // Must set the flag before pushing due to work stealing.
       assert(!debug_is_token_consumed());
-      q.push(alloc, (T*)((uintptr_t)get_token_cown() | 1));
+      q.enqueue(alloc, (T*)((uintptr_t)get_token_cown() | 1));
     }
 
     void enter_scan()
@@ -723,6 +722,7 @@ namespace verona::rt
       }
     }
 
+    template<bool during_teardown = false>
     void collect_cown_stubs()
     {
       // Cannot collect the cown state while another thread could be
@@ -744,30 +744,39 @@ namespace verona::rt
       while (*p != nullptr)
       {
         T* c = *p;
-        Systematic::cout() << "Stub collect: " << c << std::endl;
-        auto epoch = c->epoch_when_popped;
-        auto no_weak_refs = c->weak_count == 0;
-        auto outdated =
-          epoch == T::NO_EPOCH_SET || GlobalEpoch::is_outdated(epoch);
-        if (
-          c->thread.load(std::memory_order_acquire) == nullptr &&
-          no_weak_refs && outdated)
+        // Collect cown stubs when the weak count is zero.
+        if (c->weak_count == 0 || during_teardown)
         {
-          count++;
-          *p = c->next;
-          assert((!Scheduler::get_detect_leaks()) || c->cown_zero_rc());
-          c->dealloc(alloc);
-          Systematic::cout() << "Stub collected: " << c << std::endl;
+          if (c->weak_count != 0)
+          {
+            Systematic::cout() << "Leaking cown: " << c << std::endl;
+            if (Scheduler::get_detect_leaks())
+            {
+              *p = c->next;
+              continue;
+            }
+          }
+          Systematic::cout() << "Stub collect: " << c << std::endl;
+          // TODO: Investigate systematic testing coverage here.
+          auto epoch = c->epoch_when_popped;
+          auto outdated =
+            epoch == T::NO_EPOCH_SET || GlobalEpoch::is_outdated(epoch);
+          if (outdated)
+          {
+            count++;
+            *p = c->next;
+            c->dealloc(alloc);
+            Systematic::cout() << "Stub collected: " << c << std::endl;
+            continue;
+          }
+          else
+          {
+            if (!outdated)
+              Systematic::cout()
+                << "Cown " << c << " not outdated." << std::endl;
+          }
         }
-        else
-        {
-          if (!outdated)
-            Systematic::cout() << "Cown " << c << " not outdated." << std::endl;
-          if (!no_weak_refs)
-            Systematic::cout()
-              << "Cown " << c << " has weak refs." << std::endl;
-          p = &(c->next);
-        }
+        p = &(c->next);
       }
 
       free_cowns -= count;

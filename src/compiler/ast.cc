@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include "compiler/ast.h"
 
 #include "compiler/format.h"
@@ -96,6 +96,10 @@ namespace verona::compiler
     return buf;
   }
 
+  /**
+   * Binary operators are desugared into method calls, based on the name
+   * returned by this function.
+   */
   std::string_view binary_operator_method_name(BinaryOperator op)
   {
     switch (op)
@@ -104,6 +108,16 @@ namespace verona::compiler
         return "add";
       case BinaryOperator::Sub:
         return "sub";
+      case BinaryOperator::Mul:
+        return "mul";
+      case BinaryOperator::Div:
+        return "div";
+      case BinaryOperator::Mod:
+        return "mod";
+      case BinaryOperator::Shl:
+        return "shl";
+      case BinaryOperator::Shr:
+        return "shr";
       case BinaryOperator::Lt:
         return "lt";
       case BinaryOperator::Le:

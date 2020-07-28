@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include <test/harness.h>
 
 struct CCown : public VCown<CCown>
@@ -7,10 +7,10 @@ struct CCown : public VCown<CCown>
   CCown* child;
   CCown(CCown* child_) : child(child_) {}
 
-  void trace(ObjectStack* fields) const
+  void trace(ObjectStack& fields) const
   {
     if (child != nullptr)
-      fields->push(child);
+      fields.push(child);
   }
 };
 

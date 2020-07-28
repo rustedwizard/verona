@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 /**
  * This examples is exploiting a complexity in the leak detector and
  * noticeboards.
@@ -41,7 +41,7 @@ struct MyCown : public VCown<MyCown>
 {
   MyCown() {}
 
-  void trace(ObjectStack*) {}
+  void trace(ObjectStack&) {}
 };
 
 /**
@@ -62,7 +62,7 @@ struct Ping : public VAction<Ping>
     Systematic::cout() << "Ping on " << c << std::endl;
   }
 
-  void trace(ObjectStack*) const {}
+  void trace(ObjectStack&) const {}
 };
 
 void noise()
@@ -131,10 +131,10 @@ struct M2 : public VAction<M2>
     }
   }
 
-  void trace(ObjectStack* ob) const
+  void trace(ObjectStack& ob) const
   {
     if (keep_alive != nullptr)
-      ob->push(keep_alive);
+      ob.push(keep_alive);
   }
 };
 

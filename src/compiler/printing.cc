@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #include "compiler/printing.h"
 
 #include "compiler/format.h"
@@ -414,6 +414,21 @@ namespace verona::compiler
         break;
       case BinaryOperator::Sub:
         fmt::print(out, "-");
+        break;
+      case BinaryOperator::Mul:
+        fmt::print(out, "*");
+        break;
+      case BinaryOperator::Div:
+        fmt::print(out, "/");
+        break;
+      case BinaryOperator::Mod:
+        fmt::print(out, "%");
+        break;
+      case BinaryOperator::Shl:
+        fmt::print(out, "<<");
+        break;
+      case BinaryOperator::Shr:
+        fmt::print(out, ">>");
         break;
       case BinaryOperator::Lt:
         fmt::print(out, "<");

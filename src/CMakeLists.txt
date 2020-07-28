@@ -1,7 +1,5 @@
 include_directories(.)
 
-option(RT_TESTS "Including unit tests for the runtime" OFF)
-
 # Main target does not test runtime, build subdirectory for that
 if (RT_TESTS)
 else()
@@ -20,9 +18,8 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_compile_options(-Wmismatched-tags)
 endif()
 
-
+add_subdirectory(ast)
 add_subdirectory(compiler)
 add_subdirectory(interpreter)
 add_subdirectory(stdlib)
-
-clangformat_targets()
+add_subdirectory(mlir)

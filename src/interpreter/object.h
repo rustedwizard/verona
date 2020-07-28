@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "interpreter/bytecode.h"
@@ -32,7 +32,7 @@ namespace verona::interpreter
      *
      * If the object is in a new region, nullptr should be passed instead.
      */
-    explicit VMObject(VMObject* region);
+    explicit VMObject(VMObject* region, const VMDescriptor* desc);
 
     std::unique_ptr<FieldValue[]> fields;
 
@@ -43,8 +43,15 @@ namespace verona::interpreter
 
     VMObject* region();
 
-    static void trace_fn(const rt::Object* base_object, rt::ObjectStack* stack);
-    static void finaliser_fn(rt::Object* base_object);
+    static void trace_fn(const rt::Object* base_object, rt::ObjectStack& stack);
+    static void finaliser_fn(
+      rt::Object* base_object,
+      rt::Object* region,
+      rt::ObjectStack& sub_regions);
+    static void collect_iso_fields(
+      rt::Object* base_object,
+      rt::Object* region,
+      rt::ObjectStack& sub_regions);
     static void destructor_fn(rt::Object* base_object);
 
   private:
@@ -81,16 +88,10 @@ namespace verona::interpreter
       rt::VCown<VMCown>::schedule();
     }
 
-    void trace(rt::ObjectStack* stack)
+    void trace(rt::ObjectStack& stack)
     {
       if (contents != nullptr)
-        stack->push(contents);
-    }
-
-    void trace_possibly_iso(rt::ObjectStack* stack)
-    {
-      if (contents != nullptr)
-        stack->push(contents);
+        stack.push(contents);
     }
   };
 }

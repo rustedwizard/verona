@@ -11,7 +11,6 @@ git submodule update --init --recursive
 ```
 from the root of the checkout.
 
-
 ## Updating code
 
 To pull the latest code from the master branch, `cd` to the root of the
@@ -20,6 +19,42 @@ checkout and run
 git pull
 git submodule update --recursive
 ```
+
+## Updating LLVM
+
+LLVM builds take a long time, so we cached the build directory from Linux, Windows and MacOS for our CI, that can also be used on developer's machines.
+
+The CMake flag `VERONA_DOWNLOAD_LLVM` is used to control whether a cached build 
+is used or not. 
+
+```
+cmake -DVERONA_DOWNLOAD_LLVM=ON ..
+```
+Will automatically pull in a pre-compiled install directory for LLVM, and use
+that for building Verona.
+This is the default.
+
+If this flag is unset, e.g.
+```
+cmake -DVERONA_DOWNLOAD_LLVM=OFF ..
+```
+then the build will compile LLVM locally, and use that to build the Verona
+compiler.
+
+Additional, parameters can be passed to the LLVM build: e.g.
+```
+cmake -DVERONA_DOWNLOAD_LLVM=OFF .. -DLLVM_EXTRA_CMAKE_ARGS="-DLLVM_USE_SANITIZER=Address;-DLLVM_ENABLE_LLD=ON"
+```
+This examples switches on Address Sanitizer on the LLVM build, and uses LLD.
+Note the `;` to separate arguments.
+
+There is a final option, you can point Verona at a pre-built LLVM install
+directory
+```
+cmake -DVERONA_LLVM_LOCATION=[location of an instal of llvm] ..
+```
+This is useful if you are working on a LLVM/MLIR issues related to Verona in a
+separate checkout.
 
 # Building on Windows
 
@@ -39,25 +74,33 @@ Run the following inside the Developer Command Prompt for VS 2019:
 mkdir build
 cd build
 cmake .. -G "Visual Studio 16 2019" -A x64
-msbuild INSTALL.vcxproj /m /P:Configuration=Debug
+msbuild verona.sln /m /P:Configuration=Debug
 ```
 
 This builds a Debug install. Switching the last line for
 ```
-msbuild INSTALL.vcxproj /m /P:Configuration=Release
-msbuild INSTALL.vcxproj /m /P:Configuration=RelWithDebInfo
+msbuild verona.sln /m /P:Configuration=Release
+msbuild verona.sln /m /P:Configuration=RelWithDebInfo
 ```
 will build Release or Release with debug info.
 
 We currently use an install target to layout the standard library and the
 compiler in a well defined way so that it can automatically be found.
 
+Due to the complex interaction with LLVM/MLIR builds, to pass flags to the
+verona build require using the `EXTRA_VERONA_CMAKE_FLAGS`, e.g.
+```
+cmake .. -G Ninja -DEXTRA_VERONA_CMAKE_FLAGS="-DCMAKE_CXX_COMPILER=clang-cl;-DCMAKE_C_COMPILER=clang-cl"
+```
+This example specifies to build Verona with `clang-cl`. Note: the options must be
+separated by `;`.
+
 ## Subsequent builds
 
 For subsequent builds, you do not need to rerun `cmake`. From the `build`
 directory, you can run
 ```
-msbuild INSTALL.vcxproj /m
+msbuild verona.sln /m
 ```
 The default configuration is Debug.
 
@@ -110,7 +153,7 @@ Now you can run
 mkdir build_ninja
 cd build_ninja
 cmake .. -GNinja -DCMAKE_BUILD_TYPE=Debug
-ninja install
+ninja
 ```
 to build the debug installation.
 
@@ -121,11 +164,14 @@ cmake .. -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```
 to provide the other configurations.
 
-Note: Sometimes `cmake` detects `gcc` instead of `clang`.
-To override this, run `cmake` with environment variables, for example:
+Due to the complex interaction with LLVM/MLIR builds, to pass flags to the
+verona build require using the `EXTRA_VERONA_CMAKE_FLAGS`, e.g.
 ```
-cmake .. -GNinja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DCMAKE_C_COMPILER=/usr/bin/clang
+cmake .. -DEXTRA_VERONA_CMAKE_FLAGS="-DCMAKE_CXX_COMPILER=/usr/bin/clang++;-DCMAKE_C_COMPILER=/usr/bin/clang"
 ```
+This example specifies to build Verona with `clang`. Note: the options must be
+separated by `;`.
+This can be helpful as sometimes `cmake` detects `gcc` instead of `clang`.
 This may require you to remove your CMakeCache.txt file from the build
 directory.
 
@@ -134,7 +180,7 @@ directory.
 For subsequent builds, you do not need to rerun `cmake`.
 From the `build_ninja` directory, you can run
 ```
-ninja install
+ninja
 ```
 
 # Running examples
@@ -165,22 +211,17 @@ Note that the test suite requires Python 3 to be installed. If your cmake versio
 
 The test suite can be run from the `build` or `build_ninja` directories:
 ```
-ctest
+ninja check
 ```
 
-On Windows, you will need to pass the option `-C <config>` where `<config>` is
-the build type, e.g. Debug.
-
-Use the options `-j N` to run `N` jobs in parallel, and `-R <regex>` to run
-tests that match the regular expression `<regex>`.
+On Windows, this can be achieved with:
+```
+cmake --build . --target check --config <config>
+```
+Where `<config>` is the build type, e.g. Debug.
 
 ## Building the runtime tests
 
-By default, the runtime tests are not built. There are two ways to build and
-run them:
-
-  1. *Recommended:* Go into `src/rt` and follow the README instructions there.
-     This will build the tests under `src/rt/build[_ninja]`.
-  2. Run `cmake` with `-DRT_TESTS=ON`.
-     This will build the tests under `build[_ninja]/src/rt`.
-
+By default, the runtime tests are not built. To enable their building
+call cmake with `-DRT_TESTS=ON`.
+This will build the tests under `build[_ninja]/verona-prefix/src/verona-build/src/rt`.

@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+// Copyright Microsoft and Project Verona Contributors.
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "../ds/forward_list.h"
@@ -16,6 +16,14 @@ namespace verona::rt
   class Cown;
   using CownThread = SchedulerThread<Cown>;
   using Scheduler = ThreadPool<CownThread>;
+
+#ifdef USE_SYSTEMATIC_TESTING
+  /// 1/2^range_bits likelyhood of coin saying true
+  inline bool coin(size_t range_bits)
+  {
+    return Scheduler::coin(range_bits);
+  }
+#endif
 
   static void yield()
   {
@@ -34,6 +42,11 @@ namespace verona::rt
       NoTryFast,
       YesTryFast
     };
+
+    Cown(const Descriptor* desc) : Object(desc)
+    {
+      this->init(ThreadAlloc::get(), desc, Scheduler::alloc_epoch());
+    }
 
   private:
     friend class DLList<Cown>;
@@ -58,7 +71,10 @@ namespace verona::rt
     verona::rt::MPSCQ<MultiMessage> queue;
 
     // Used for garbage collection of cyclic cowns only.
-    std::atomic<SchedulerThread<Cown>*> thread;
+    // Uses the bottom bit to indicate the cown has been collected
+    // If the object is collected by the leak detector, we should not
+    // collect again when the weak reference count hits 0.
+    std::atomic<uintptr_t> thread_status;
     Cown* next;
 
     /**
@@ -80,8 +96,34 @@ namespace verona::rt
       return a;
     }
 
+    static constexpr uintptr_t collected_mask = 1;
+    static constexpr uintptr_t thread_mask = ~collected_mask;
+
+    void set_owning_thread(SchedulerThread<Cown>* owner)
+    {
+      thread_status = (uintptr_t)owner;
+    }
+
+    void mark_collected()
+    {
+      thread_status |= 1;
+    }
+
+    bool is_collected()
+    {
+      return (thread_status.load(std::memory_order_relaxed) & collected_mask) !=
+        0;
+    }
+
+    SchedulerThread<Cown>* owning_thread()
+    {
+      return (
+        SchedulerThread<
+          Cown>*)(thread_status.load(std::memory_order_relaxed) & thread_mask);
+    }
+
   public:
-#ifdef USE_SYSTEMATIC_TESTING
+#ifdef USE_SYSTEMATIC_TESTING_WEAK_NOTICEBOARDS
     std::vector<BaseNoticeboard*> noticeboards;
 
     void flush_all(Alloc* alloc)
@@ -141,7 +183,7 @@ namespace verona::rt
       TryFastSend try_fast = NoTryFast>
     bool send(MultiMessage* m)
     {
-#ifdef USE_SYSTEMATIC_TESTING
+#ifdef USE_SYSTEMATIC_TESTING_WEAK_NOTICEBOARDS
       flush_all(ThreadAlloc::get());
 
       Scheduler::yield_my_turn();
@@ -223,6 +265,8 @@ namespace verona::rt
 
       Systematic::cout() << "Cown dealloc: " << o << std::endl;
 
+      bool collect_not_required = a->is_collected();
+
       // During teardown don't recursively delete.
       if (Scheduler::is_teardown_in_progress())
       {
@@ -250,37 +294,39 @@ namespace verona::rt
       }
 
       // If last, then collect the cown body.
-      a->collect(alloc);
+      if (!collect_not_required)
+        a->collect(alloc);
       yield();
       a->weak_release(alloc);
     }
 
     /**
      * Release a weak reference to this cown.
-     *
-     * This sets thread field to nullptr, so that the scheduler thread
-     * responsible for this cown can collect the stub.
      **/
     void weak_release(Alloc* alloc)
     {
       Systematic::cout() << "Weak release " << this << std::endl;
       if (weak_count.fetch_sub(1) == 1)
       {
-        auto* t = thread.load(std::memory_order_relaxed);
+        auto* t = owning_thread();
         yield();
         if (!t)
         {
+          // Deallocate an unowned cown
+          Systematic::cout()
+            << "Not allocated on a Verona thread, so deallocating: " << this
+            << std::endl;
           assert(epoch_when_popped == NO_EPOCH_SET);
           dealloc(alloc);
           return;
         }
+        // Register that the epoch should be moved on
         {
           Epoch e(alloc);
           e.add_pressure();
         }
+        // Tell owning thread that it has a free cown to collect.
         t->free_cowns++;
-        thread.store(nullptr, std::memory_order_release);
-
         yield();
       }
     }
@@ -345,14 +391,14 @@ namespace verona::rt
 
       if (local != nullptr)
       {
-        thread = local;
+        set_owning_thread(local);
         next = local->list;
         local->list = this;
         local->total_cowns++;
       }
       else
       {
-        thread = nullptr;
+        set_owning_thread(nullptr);
         next = nullptr;
       }
     }
@@ -559,6 +605,7 @@ namespace verona::rt
       // counted as inflight
       if (Scheduler::should_scan() && e == Scheduler::local()->send_epoch)
       {
+        // TODO: Investigate systematic testing coverage here.
         if (cown->get_epoch_mark() != Scheduler::local()->send_epoch)
         {
           cown->scan(alloc, Scheduler::local()->send_epoch);
@@ -794,6 +841,7 @@ namespace verona::rt
           // if (Scheduler::in_prescan())
           //   return true;
           //
+          // TODO: Investigate systematic testing coverage here.
           if (n != 0)
             return true;
 
@@ -861,7 +909,7 @@ namespace verona::rt
         return false;
 
       // Check if the Cown is already collected
-      if (thread != nullptr)
+      if (!is_collected())
       {
 #ifdef USE_SYSTEMATIC_TESTING
         Scheduler::yield_my_turn();
@@ -870,7 +918,6 @@ namespace verona::rt
         Systematic::cout() << "Collecting (sweep)" << this << std::endl;
 
         collect(alloc);
-        thread = nullptr;
       }
 
       return true;
@@ -883,13 +930,22 @@ namespace verona::rt
 
     void collect(Alloc* alloc)
     {
-#ifdef USE_SYSTEMATIC_TESTING
+      // If this was collected by leak detector, then don't double dealloc
+      // cown body, when the ref count drops.
+      if (is_collected())
+        return;
+
+      mark_collected();
+
+#ifdef USE_SYSTEMATIC_TESTING_WEAK_NOTICEBOARDS
       flush_all(alloc);
 #endif
       Systematic::cout() << "Collecting: " << this << std::endl;
 
+      ObjectStack dummy(alloc);
       // Run finaliser before releasing our data.
-      finalise();
+      // Sub-regions handled by code below.
+      finalise(nullptr, dummy);
 
       // Release our data.
       ObjectStack f(alloc);
