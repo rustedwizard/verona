@@ -25,7 +25,7 @@ struct C : public V<C>
   }
 };
 
-struct Ping : public VAction<Ping>
+struct Ping : public VBehaviour<Ping>
 {
   void f() {}
 };
@@ -58,7 +58,7 @@ struct A : public VCown<A>
 
 ExternalRef* g_ext_ref = nullptr;
 
-struct Loop : public VAction<Loop>
+struct Loop : public VBehaviour<Loop>
 {
   A* a;
   Loop(A* a) : a(a) {}
@@ -154,13 +154,12 @@ struct Loop : public VAction<Loop>
 // 5. Clean up resource, and exit.
 void run_test(size_t cores = 4, size_t seed = 100)
 {
-  Scheduler& sched = Scheduler::get();
 #ifdef USE_SYSTEMATIC_TESTING
-  sched.set_seed(seed);
+  Systematic::set_seed(seed);
 #else
   UNUSED(seed);
 #endif
-
+  Scheduler& sched = Scheduler::get();
   sched.init(cores);
 
   auto* alloc = ThreadAlloc::get();

@@ -15,7 +15,7 @@ namespace verona
    * This class encapsulates a simple Feistel network to provide a permutation
    * function on pointer sized values, which is then used to compare the
    * pointers.  This is useful for testing different orders of cown acquisition
-   * inside a multimessage.
+   * inside a multi-message.
    *
    * The implementation is guaranteed to be a permutation as a Feisel network is
    * invertible.  This is not a crytpographic primitive, it is just a compact
@@ -32,6 +32,17 @@ namespace verona
 
     uintptr_t keys[ROUNDS];
 
+  public:
+    Scramble() {}
+
+    void setup(xoroshiro::p128r32& r)
+    {
+      for (size_t i = 0; i < ROUNDS; i++)
+      {
+        keys[i] = (uintptr_t)r.next();
+      }
+    }
+
     uintptr_t perm(uintptr_t p)
     {
       uintptr_t l = p & MASK_BOTTOM;
@@ -45,26 +56,6 @@ namespace verona
       }
 
       return l + ((uintptr_t)r << PTR_HALF_SHIFT);
-    }
-
-  public:
-    Scramble() {}
-
-    void setup(xoroshiro::p128r32& r)
-    {
-      for (size_t i = 0; i < ROUNDS; i++)
-      {
-        keys[i] = (uintptr_t)r.next();
-      }
-    }
-
-    /**
-     * This operator provides a comparison using the builtin scrambling from the
-     * underlying feisel network.
-     **/
-    bool operator()(void* p1, void* p2)
-    {
-      return perm((uintptr_t)p1) < perm((uintptr_t)p2);
     }
   };
 }

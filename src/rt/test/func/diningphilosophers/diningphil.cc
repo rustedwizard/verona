@@ -1,7 +1,6 @@
 // Copyright Microsoft and Project Verona Contributors.
 // SPDX-License-Identifier: MIT
 #include <ds/scramble.h>
-#include <random>
 #include <test/harness.h>
 
 struct Fork : public VCown<Fork>
@@ -18,7 +17,7 @@ struct Fork : public VCown<Fork>
   }
 };
 
-struct Ping : public VAction<Ping>
+struct Ping : public VBehaviour<Ping>
 {
   void f() {}
 };
@@ -30,7 +29,7 @@ struct Ping : public VAction<Ping>
  * will be reclaimable, once this message is delivered it will be
  * deallocated.
  **/
-struct KeepAlive : public VAction<KeepAlive>
+struct KeepAlive : public VBehaviour<KeepAlive>
 {
   Cown* c;
 
@@ -72,7 +71,7 @@ struct Philosopher : public VCown<Philosopher>
 
 void eat_send(Philosopher* p);
 
-struct Ponder : public VAction<Ponder>
+struct Ponder : public VBehaviour<Ponder>
 {
   Philosopher* p;
 
@@ -87,7 +86,7 @@ struct Ponder : public VAction<Ponder>
   }
 };
 
-struct Eat : public VAction<Eat>
+struct Eat : public VBehaviour<Eat>
 {
   Philosopher* eater;
 
@@ -157,7 +156,8 @@ void test_dining(
     std::vector<Cown*> my_forks;
 
     std::sort(forks.begin(), forks.end(), [&scrambler](Fork*& a, Fork*& b) {
-      return scrambler(((Cown*)a)->id(), ((Cown*)b)->id());
+      return scrambler.perm(((Cown*)a)->id()) <
+        scrambler.perm(((Cown*)b)->id());
     });
 
     for (size_t j = 0; j < fork_count; j++)

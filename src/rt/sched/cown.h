@@ -6,6 +6,7 @@
 #include "../ds/mpscq.h"
 #include "../region/region.h"
 #include "../test/systematic.h"
+#include "backpressure.h"
 #include "base_noticeboard.h"
 #include "multimessage.h"
 #include "schedulerthread.h"
@@ -17,14 +18,6 @@ namespace verona::rt
   using CownThread = SchedulerThread<Cown>;
   using Scheduler = ThreadPool<CownThread>;
 
-#ifdef USE_SYSTEMATIC_TESTING
-  /// 1/2^range_bits likelyhood of coin saying true
-  inline bool coin(size_t range_bits)
-  {
-    return Scheduler::coin(range_bits);
-  }
-#endif
-
   static void yield()
   {
 #ifdef USE_SYSTEMATIC_TESTING
@@ -32,9 +25,23 @@ namespace verona::rt
 #endif
   }
 
+  /**
+   * A cown, or concurrent owner, encapsulates a set of resources that may be
+   * accessed by a single (scheduler) thread at a time. A cown can only be in
+   * exactly one of the following states:
+   *   1. Unscheduled
+   *   2. Scheduled, in the queue of a single scheduler thread
+   *   3. Running on a single scheduler thread
+   *
+   * Once a cown is running, it executes a batch of multi-message behaviours.
+   * Each message may either acquire the running cown for participation in a
+   * future behaviour, or execute the behaviour if it is the last cown to be
+   * acquired. If the running cown is acquired for a future behaviour, it will
+   * be descheduled until that behaviour has completed.
+   */
   class Cown : public Object
   {
-    static constexpr size_t BATCH_COUNT = 100;
+    using MessageBody = MultiMessage::MultiMessageBody;
 
   public:
     enum TryFastSend
@@ -83,6 +90,8 @@ namespace verona::rt
      * strong reference still exists.
      **/
     std::atomic<size_t> weak_count = 1;
+
+    std::atomic<Backpressure> backpressure{};
 
     static Cown* create_token_cown()
     {
@@ -173,7 +182,7 @@ namespace verona::rt
      *
      * By default, the template parameter `try_fast` is NoTryFast, which means
      * this method will schedule the Cown if it was asleep. In an optimized
-     * multimessage send, we want to avoid scheduling, because we want to
+     * multi-message send, we want to avoid scheduling, because we want to
      * immediately acquire the cown without going through the scheduler queue.
      * In this case, pass `try_fast = YesTryFast` as the second template
      * argument.
@@ -206,7 +215,7 @@ namespace verona::rt
         if constexpr (try_fast == NoTryFast)
         {
           // The cown's queue was previously empty, schedule it, but only if
-          // this is not an optimized multimessage send.
+          // this is not an optimized multi-message send.
           schedule();
         }
       }
@@ -265,8 +274,6 @@ namespace verona::rt
 
       Systematic::cout() << "Cown dealloc: " << o << std::endl;
 
-      bool collect_not_required = a->is_collected();
-
       // During teardown don't recursively delete.
       if (Scheduler::is_teardown_in_progress())
       {
@@ -294,10 +301,11 @@ namespace verona::rt
       }
 
       // If last, then collect the cown body.
-      if (!collect_not_required)
-        a->collect(alloc);
-      yield();
-      a->weak_release(alloc);
+      if (!a->is_collected())
+        // Queue_collect calls weak release.
+        a->queue_collect(alloc);
+      else
+        a->weak_release(alloc);
     }
 
     /**
@@ -408,7 +416,7 @@ namespace verona::rt
     {
       // This should only be called if the cown is known to have been
       // unscheduled, for example when detecting a previously empty message
-      // queue on send, or when rescheduling after a multimessage.
+      // queue on send, or when rescheduling after a multi-message.
       CownThread* t = Scheduler::local();
 
       if (t != nullptr)
@@ -502,27 +510,27 @@ namespace verona::rt
     }
 
     /**
-     * A "synchronous" version of multimessage send, to be used by
+     * A "synchronous" version of multi-message send, to be used by
      * Cown::run_step and Cown::schedule.
      *
      * Assumes that cowns [0, index) have already been acquired. Tries to
      * acquire the remaining cowns [index, count).
      *
-     * Sends a multimessage to `cowns[index]`. If the cown can be acquired
+     * Sends a multi-message to `cowns[index]`. If the cown can be acquired
      * immediately without rescheduling (i.e. its queue was sleeping), then we
      * send the next message to try to acquire the next cown. We repeat this
      * until:
      *
      * (1) The target cown was not sleeping (i.e. it is scheduled, running, or
-     *     has already been acquired in a multimessage). This means we are done
+     *     has already been acquired in a multi-message). This means we are done
      *     here, and have to wait for that cown to run and then handle our
      *     message.
      * (2) We sent the message to the last cown. There are no further cowns to
      *     acquire, so we schedule the last cown so it can handle the
-     *     multimessage action.
-     *     TODO: It would be semantically valid to execute the action without
+     *     multi-message behaviour.
+     *     TODO: It would be semantically valid to execute the behaviour without
      *     rescheduling. However, for fairness, it is better to reschedule in
-     *     case the action executes for a very long time.
+     *     case the behaviour executes for a very long time.
      **/
     static void fast_send(MultiMessage::MultiMessageBody* body, EpochMark epoch)
     {
@@ -546,17 +554,19 @@ namespace verona::rt
         {
           // Case 1: target cown was already scheduled.
           Systematic::cout()
-            << "MultiMessage fast send interrupted" << std::endl;
+            << "MultiMessage " << m << " fast send interrupted" << std::endl;
           return;
         }
         else if (body->index == last)
         {
           // Case 2: acquired the last cown.
           Systematic::cout()
-            << "MultiMessage fast acquired " << cowns[body->index] << std::endl;
+            << "MultiMessage " << m
+            << " fast acquire cown: " << cowns[body->index] << std::endl;
           Systematic::cout()
-            << "MultiMessage fast send completed, rescheduling cown "
-            << cowns[body->index] << std::endl;
+            << "MultiMessage " << m
+            << " fast send complete, reschedule cown: " << cowns[body->index]
+            << std::endl;
           cowns[body->index]->schedule();
           return;
         }
@@ -564,7 +574,7 @@ namespace verona::rt
         // The cown was asleep, so we have acquired it now. Dequeue the message
         // because we want to handle it now. Note that after dequeueing, the
         // queue may be non-empty: the scheduler may have allowed another
-        // multimessage to request and send another message to this cown.
+        // multi-message to request and send another message to this cown.
         // However, we are guaranteed to be the first message in the queue.
         bool notify;
         MultiMessage* m2 =
@@ -574,18 +584,18 @@ namespace verona::rt
         Systematic::cout() << "MultiMessage " << m2 << " index " << body->index
                            << " fast acquired " << cowns[body->index]
                            << std::endl;
-        Systematic::cout() << "Sending next multimessage" << std::endl;
+        Systematic::cout() << "Sending next MultiMessage" << std::endl;
       }
     }
 
     /**
-     * Execute the action of the given multimessage.
+     * Execute the behaviour of the given multi-message.
      *
-     * If the multimessage has not completed, then we will send a message to
+     * If the multi-message has not completed, then we will send a message to
      * the next cown to acquire.
      *
      * Otherwise, all cowns have been acquired and we can execute the message
-     * action.
+     * behaviour.
      **/
     static bool run_step(MultiMessage* m)
     {
@@ -682,7 +692,7 @@ namespace verona::rt
 
           // Scan closure
           ObjectStack f(alloc);
-          body.action->trace(f);
+          body.behaviour->trace(f);
           scan_stack(alloc, Scheduler::local()->send_epoch, f);
         }
         else
@@ -692,19 +702,16 @@ namespace verona::rt
         }
       }
 
-      // Run the action.
-      body.action->f();
+      Scheduler::local()->message_body = &body;
+
+      // Run the behaviour.
+      body.behaviour->f();
 
       Systematic::cout() << "MultiMessage " << m << " completed and running on "
                          << cown << std::endl;
 
-      // Reschedule all the cowns.
-      for (size_t i = 0; i < last; i++)
-        body.cowns[i]->schedule();
-
-      // Free the destination array and the action
-      alloc->dealloc(body.cowns, body.count * sizeof(Cown*));
-      alloc->dealloc(body.action, body.action->size());
+      // Free the body and the behaviour.
+      alloc->dealloc(body.behaviour, body.behaviour->size());
       alloc->dealloc<sizeof(MultiMessage::MultiMessageBody)>(m->get_body());
 
       return true;
@@ -722,30 +729,31 @@ namespace verona::rt
     }
 
     /**
-     * Sends a multimessage to the first cown we want to acquire.
+     * Sends a multi-message to the first cown we want to acquire.
      *
      * Pass `transfer = YesTransfer` as a template argument if the
      * caller is transfering ownership of a reference count on each cown to this
      * method.
      **/
     template<
-      class Behaviour,
+      class Be,
       TransferOwnership transfer = NoTransfer,
       typename... Args>
     static void schedule(size_t count, Cown** cowns, Args&&... args)
     {
-      Systematic::cout() << "Schedule behaviour of type: "
-                         << typeid(Behaviour).name() << std::endl;
+      static_assert(std::is_base_of_v<Behaviour, Be>);
+      Systematic::cout() << "Schedule behaviour of type: " << typeid(Be).name()
+                         << std::endl;
 
-      Alloc* alloc = ThreadAlloc::get();
-      Behaviour* b = (Behaviour*)alloc->alloc<sizeof(Behaviour)>();
-      Action* action = new (b) Behaviour(std::forward<Args>(args)...);
-      Cown** sort = (Cown**)alloc->alloc(count * sizeof(Cown*));
+      auto* alloc = ThreadAlloc::get();
+      auto* be =
+        new ((Be*)alloc->alloc<sizeof(Be)>()) Be(std::forward<Args>(args)...);
+      auto** sort = (Cown**)alloc->alloc(count * sizeof(Cown*));
       memcpy(sort, cowns, count * sizeof(Cown*));
 
 #ifdef USE_SYSTEMATIC_TESTING
       std::sort(&sort[0], &sort[count], [](Cown*& a, Cown*& b) {
-        return Scheduler::get_scrambler()(a->id(), b->id());
+        return a->id() < b->id();
       });
 #else
       std::sort(&sort[0], &sort[count]);
@@ -757,7 +765,7 @@ namespace verona::rt
           Cown::acquire(sort[i]);
       }
 
-      auto body = MultiMessage::make_body(alloc, count, sort, action);
+      auto body = MultiMessage::make_body(alloc, count, sort, be);
 
       // TODO what if this thread is external.
       //  EPOCH_A okay as currently only sending externally, before we start
@@ -771,9 +779,209 @@ namespace verona::rt
         Scheduler::record_inflight_message();
       }
 
+      if ((sched != nullptr) && (sched->message_body != nullptr))
+        backpressure_scan(*sched->message_body, *body);
+
       // Try to acquire as many cowns as possible without rescheduling,
       // starting from the beginning.
       fast_send(body, epoch);
+    }
+
+    /**
+     * Unmute a cown if it is muted.
+     */
+    inline void unmute(bool set_unmutable = false)
+    {
+      auto bp = backpressure.load(std::memory_order_acquire);
+      yield();
+      Backpressure bp_unmuted;
+      bool needs_resched;
+      do
+      {
+        needs_resched = bp.muted();
+        bp_unmuted = bp;
+
+        if (set_unmutable)
+        {
+          if (bp.unmutable() && !bp.unmutable_dirty())
+            return;
+
+          bp_unmuted.set_state_unmutable();
+        }
+        else
+        {
+          if (!bp.muted())
+            return;
+          if (bp.muted())
+            bp_unmuted.set_state_normal();
+        }
+
+        yield();
+      } while (
+#ifdef USE_SYSTEMATIC_TESTING
+        Systematic::coin(9) ||
+#endif
+        !backpressure.compare_exchange_weak(
+          bp, bp_unmuted, std::memory_order_acq_rel));
+
+      yield();
+      assert(set_unmutable || needs_resched);
+
+      if (!needs_resched)
+        return;
+
+      Systematic::cout() << "Unmute " << this
+                         << (set_unmutable ? " (unmutable)" : "") << std::endl;
+
+      queue.wake();
+      schedule();
+    }
+
+    /**
+     * Set the `mutor` field of the current scheduler thread if the senders
+     * should be muted as a result of this message. Otherwise the `mutor` will
+     * remain null.
+     */
+    static inline void
+    backpressure_scan(const MessageBody& senders, const MessageBody& receivers)
+    {
+      // Make receivers unmutable if any sender is overloaded.
+      for (size_t s = 0; s < senders.count; s++)
+      {
+        auto* sender = senders.cowns[s];
+        if (
+          !sender->backpressure.load(std::memory_order_relaxed).overloaded()
+#ifdef USE_SYSTEMATIC_TESTING
+          && !Systematic::coin(3)
+#endif
+        )
+          continue;
+
+        yield();
+
+        for (size_t r = 0; r < receivers.count; r++)
+        {
+          auto* receiver = receivers.cowns[r];
+          receiver->unmute(true);
+        }
+        return;
+      }
+
+      if (Scheduler::local()->mutor != nullptr)
+        return;
+
+      // Ignore message if any senders are are in the set of receivers.
+      for (size_t s = 0; s < senders.count; s++)
+      {
+        for (size_t r = 0; r < receivers.count; r++)
+        {
+          if (senders.cowns[s] == receivers.cowns[r])
+            return;
+        }
+      }
+
+      // Mute senders if any receivers are overloaded/muted.
+      for (size_t r = 0; r < receivers.count; r++)
+      {
+        auto* receiver = receivers.cowns[r];
+        const auto bp = receiver->backpressure.load(std::memory_order_acquire);
+        yield();
+        if (
+          bp.triggers_muting()
+#ifdef USE_SYSTEMATIC_TESTING
+          || Systematic::coin(5)
+#endif
+        )
+        {
+          assert(Scheduler::local()->mutor == nullptr);
+          Scheduler::local()->mutor = receiver;
+          receiver->weak_acquire();
+          return;
+        }
+      }
+    }
+
+    /**
+     * Update backpressure based on the occurrence of a token message. Return
+     * true if the current message is a token.
+     */
+    inline bool check_message_token(Alloc* alloc, MessageBody* curr)
+    {
+      auto bp = backpressure.load(std::memory_order_relaxed);
+      yield();
+      bool token_reached = false;
+      bool load_reset = false;
+      if (curr == nullptr)
+      {
+        Systematic::cout() << "Reached message token on cown: " << this
+                           << std::endl;
+        assert(bp.has_token());
+        token_reached = true;
+      }
+      else
+      {
+        if (
+          (!bp.has_token() && (curr->index == 0)) ||
+          (bp.current_load() == 0xff))
+        {
+          load_reset = true;
+        }
+        if (!bp.has_token())
+        {
+          Systematic::cout()
+            << "Enqueue message token on cown: " << this << std::endl;
+          queue.enqueue(stub_msg(alloc));
+        }
+      }
+
+      Backpressure bp_update;
+      do
+      {
+        bp_update = bp;
+        if (token_reached)
+        {
+          bp_update.unset_has_token();
+          if (bp.unmutable())
+            bp.unmutable_dirty();
+          else if (bp.unmutable_dirty())
+            bp.set_state_normal();
+        }
+        else
+        {
+          if (load_reset)
+            bp_update.reset_load();
+
+          bp_update.inc_load();
+          bp_update.set_has_token();
+        }
+
+        yield();
+        // The following exchange will fail when another thread has set this
+        // cown to unmutable.
+      } while (
+#ifdef USE_SYSTEMATIC_TESTING
+        Systematic::coin(9) ||
+#endif
+        !backpressure.compare_exchange_weak(
+          bp, bp_update, std::memory_order_acq_rel));
+      yield();
+
+      return token_reached;
+    }
+
+    /**
+     * Mute the senders participating in this message if a backpressure scan
+     * set the mutor during the behaviour. If false is returned, the caller must
+     * reschedule the senders and deallocate the senders array.
+     */
+    inline bool apply_backpressure(Cown** senders, size_t count)
+    {
+      if (Scheduler::local()->mutor == nullptr)
+        return false;
+
+      Scheduler::local()->mute(senders, count);
+      Scheduler::local()->mutor = nullptr;
+      return true;
     }
 
     /**
@@ -781,7 +989,7 @@ namespace verona::rt
      *
      * It returns false, if the cown should not be rescheduled.
      *
-     * It will process multimessages and notifications.
+     * It will process multi-messages and notifications.
      *
      * The notifications will only be processed once in a call to this.  It will
      * not process messages that were not in the queue before it began
@@ -790,22 +998,29 @@ namespace verona::rt
      * If this cown receives a notification after it has already called
      * cown_notified, then it guarantees to call cown_notified next time it is
      * called, and it is guaranteed to return true, so it will be rescheduled
-     * or false if it is part of a multimessage acquire.
+     * or false if it is part of a multi-message acquire.
      **/
     bool run(Alloc* alloc, ThreadState::State, EpochMark)
     {
       auto until = queue.peek_back();
       yield(); // Reading global state in peek_back().
 
+      const auto bp = backpressure.load(std::memory_order_acquire);
+      yield();
+      assert(!bp.muted());
+      // The batch limit is between 100 and 251, depending on the load.
+      const auto batch_limit = (size_t)100 | ((size_t)bp.total_load() >> 3);
+
       auto notified_called = false;
       auto notify = false;
 
-      // Handle up to BATCH_COUNT messages.
-      for (size_t n = 0; n < BATCH_COUNT; n++)
+      MultiMessage* curr = nullptr;
+      size_t batch_size = 0;
+      do
       {
         assert(!queue.is_sleeping());
 
-        MultiMessage* curr = queue.dequeue(alloc, notify);
+        curr = queue.dequeue(alloc, notify);
 
         if (!notified_called && notify)
         {
@@ -842,7 +1057,7 @@ namespace verona::rt
           //   return true;
           //
           // TODO: Investigate systematic testing coverage here.
-          if (n != 0)
+          if (batch_size != 0)
             return true;
 
           // Reschedule if cown does not go to sleep.
@@ -858,7 +1073,7 @@ namespace verona::rt
           }
 
           Systematic::cout()
-            << "Cown has no work this time:" << this << std::endl;
+            << "Cown has no work this time: " << this << std::endl;
           // Deschedule the cown.
           Cown::release(alloc, this);
           return false;
@@ -866,24 +1081,33 @@ namespace verona::rt
 
         assert(!queue.is_sleeping());
 
+        if (check_message_token(alloc, curr->get_body()))
+          return true;
+
+        batch_size++;
+
         Systematic::cout() << "Running Message " << curr << " on " << this
                            << std::endl;
+
+        auto* senders = curr->get_body()->cowns;
+        const size_t senders_count = curr->get_body()->count;
 
         // A function that returns false indicates that the cown should not
         // be rescheduled, even if it has pending work. This also means the
         // cown's queue should not be marked as empty, even if it is.
         if (!run_step(curr))
-        {
           return false;
-        }
 
-        // If we hit the end then tell scheduler thread to reschedule this cown.
-        // TODO Back pressure, this should trigger back pressure on this cown.
-        if (curr == until)
-        {
-          break;
-        }
-      }
+        if (apply_backpressure(senders, senders_count))
+          return false;
+
+        // Reschedule the other cowns.
+        for (size_t s = 0; s < (senders_count - 1); s++)
+          senders[s]->schedule();
+
+        alloc->dealloc(senders, senders_count * sizeof(Cown*));
+
+      } while ((curr != until) && (batch_size < batch_limit));
 
       return true;
     }
@@ -908,14 +1132,16 @@ namespace verona::rt
       if (in_epoch(epoch))
         return false;
 
-      // Check if the Cown is already collected
-      if (!is_collected())
+      // Check if the Cown is already collected or is muted.
+      if (
+        !is_collected() &&
+        !backpressure.load(std::memory_order_acquire).muted())
       {
 #ifdef USE_SYSTEMATIC_TESTING
         Scheduler::yield_my_turn();
 #endif
 
-        Systematic::cout() << "Collecting (sweep)" << this << std::endl;
+        Systematic::cout() << "Collecting (sweep) " << this << std::endl;
 
         collect(alloc);
       }
@@ -926,6 +1152,42 @@ namespace verona::rt
     inline bool is_live(EpochMark send_epoch)
     {
       return in_epoch(EpochMark::SCHEDULED_FOR_SCAN) || in_epoch(send_epoch);
+    }
+
+    /**
+     * Called when strong reference count reaches one.
+     * Uses thread_local state to deal with deep deallocation
+     * chains by queuing recursive calls.
+     **/
+    void queue_collect(Alloc* alloc)
+    {
+      thread_local ObjectStack* work_list = nullptr;
+
+      // If there is a already a queue, use it
+      if (work_list != nullptr)
+      {
+        work_list->push(this);
+        return;
+      }
+
+      // Make queue for recursive deallocations.
+      ObjectStack current(alloc);
+      work_list = &current;
+
+      // Collect the current cown
+      collect(alloc);
+      yield();
+      weak_release(alloc);
+
+      // Collect recursively reachable cowns
+      while (!current.empty())
+      {
+        auto a = (Cown*)current.pop();
+        a->collect(alloc);
+        yield();
+        a->weak_release(alloc);
+      }
+      work_list = nullptr;
     }
 
     void collect(Alloc* alloc)
@@ -977,11 +1239,16 @@ namespace verona::rt
         }
       }
 
+      yield();
+      assert(!backpressure.load(std::memory_order_acquire).muted());
+
       // Now we may run our destructor.
       destructor();
 
-      MultiMessage* last = queue.destroy();
-      alloc->dealloc<sizeof(MultiMessage)>(last);
+      MultiMessage* stub = queue.destroy();
+      // All messages must have been run by the time the cown is collected.
+      assert(stub->next.load(std::memory_order_relaxed) == nullptr);
+      alloc->dealloc<sizeof(MultiMessage)>(stub);
     }
 
     static MultiMessage* stub_msg(Alloc* alloc)

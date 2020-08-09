@@ -16,6 +16,10 @@
 
 #include "../ds/asymlock.h"
 #include "ds/morebits.h"
+#ifdef USE_SYSTEMATIC_TESTING
+#  include "ds/scramble.h"
+#  include "test/xoroshiro.h"
+#endif
 
 #include <iomanip>
 #include <iostream>
@@ -24,6 +28,34 @@
 
 namespace Systematic
 {
+#ifdef USE_SYSTEMATIC_TESTING
+  static inline xoroshiro::p128r32& get_rng()
+  {
+    static thread_local xoroshiro::p128r32 rng;
+    return rng;
+  }
+
+  static inline verona::Scramble& get_scrambler()
+  {
+    static thread_local verona::Scramble scrambler;
+    return scrambler;
+  }
+
+  static inline void set_seed(uint64_t seed)
+  {
+    auto& rng = get_rng();
+    rng.set_state(seed);
+    get_scrambler().setup(rng);
+  }
+
+  /// 1/(2^range_bits) likelyhood of returning true
+  static inline bool coin(size_t range_bits = 1)
+  {
+    assert(range_bits < 20);
+    return (get_rng().next() & ((1ULL << range_bits) - 1)) == 0;
+  }
+#endif
+
 #ifdef USE_FLIGHT_RECORDER
   static constexpr bool flight_recorder = true;
 #else
@@ -489,25 +521,35 @@ namespace Systematic
     for (auto i = 2; i < n_frames; i++)
     {
       auto* sym = syms[i];
-      auto* mangle_0 = strchr(sym, '(');
-      auto* mangle_n = strchr(mangle_0, '+');
-
-      if (!mangle_n || ((mangle_0 + 1) == mangle_n))
+#  ifdef __APPLE__
+      // macOS symbol format: index  module   address function + offset
+      auto* mangled_end = strrchr(sym, '+') - 1;
+      *mangled_end = 0;
+      auto* mangled_begin = strrchr(sym, ' ') + 1;
+      *mangled_end = ' ';
+#  else
+      // symbol format: module(function+offset) [address]
+      auto* mangled_begin = strchr(sym, '(') + 1;
+      auto* mangled_end = strchr(sym, '+');
+#  endif
+      auto* sym_end = sym + strlen(sym);
+      if (
+        (mangled_begin < sym) || (mangled_end > sym_end) ||
+        (mangled_end <= mangled_begin))
       {
         std::cerr << sym << std::endl;
         continue;
       }
-
-      size_t mangle_len = (size_t)(mangle_n - mangle_0) - 1;
-      strncpy(buf, mangle_0 + 1, mangle_len);
-      buf[mangle_len] = 0;
+      size_t mangled_len = (size_t)(mangled_end - mangled_begin);
+      strncpy(buf, mangled_begin, mangled_len);
+      buf[mangled_len] = 0;
       auto err = 0;
       auto size = buf_size;
       char* demangled = abi::__cxa_demangle(buf, demangle_buf, &size, &err);
       if (!err)
       {
-        std::cerr.write(sym, mangle_0 - sym - 1);
-        std::cerr << "(" << demangled << mangle_n << std::endl;
+        std::cerr.write(sym, mangled_begin - sym);
+        std::cerr << demangled << mangled_end << std::endl;
       }
       else
       {

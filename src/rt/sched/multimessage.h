@@ -4,7 +4,7 @@
 
 #include "../ds/mpscq.h"
 #include "../object/object.h"
-#include "action.h"
+#include "behaviour.h"
 
 #include <snmalloc.h>
 
@@ -19,7 +19,7 @@ namespace verona::rt
       size_t index;
       size_t count;
       Cown** cowns;
-      Action* action;
+      Behaviour* behaviour;
     };
 
   private:
@@ -27,7 +27,7 @@ namespace verona::rt
     friend verona::rt::MPSCQ<MultiMessage>;
     friend class Cown;
 
-    std::atomic<MultiMessage*> next;
+    std::atomic<MultiMessage*> next{nullptr};
 
     inline MultiMessageBody* get_body()
     {
@@ -59,8 +59,8 @@ namespace verona::rt
         (e == EpochMark::EPOCH_NONE) || (e == EpochMark::EPOCH_A) ||
         (e == EpochMark::EPOCH_B));
 
-      Systematic::cout() << this << " state change " << get_epoch() << " -> "
-                         << e << std::endl;
+      Systematic::cout() << "MultiMessage epoch: " << this << " " << get_epoch()
+                         << " -> " << e << std::endl;
 
       body = (MultiMessageBody*)((uintptr_t)get_body() | (size_t)e);
 
@@ -68,17 +68,10 @@ namespace verona::rt
     }
 
     static MultiMessageBody*
-    make_body(Alloc* alloc, size_t count, Cown** cowns, Action* action)
+    make_body(Alloc* alloc, size_t count, Cown** cowns, Behaviour* behaviour)
     {
-      auto body = (MultiMessageBody*)alloc->alloc<sizeof(MultiMessageBody)>();
-      body->index = 0;
-      body->count = count;
-      body->cowns = cowns;
-      body->action = action;
-
-      Systematic::cout() << "MultiMessageBody " << body << std::endl;
-
-      return body;
+      return new (alloc->alloc<sizeof(MultiMessageBody)>())
+        MultiMessageBody{0, count, cowns, behaviour};
     }
 
     static MultiMessage*

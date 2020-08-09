@@ -279,7 +279,7 @@ namespace verona::rt
       if (key == nullptr)
         return end();
 
-      const auto hash = bits::hash((void*)key);
+      const auto hash = bits::hash(key->id());
       auto index = hash & (capacity() - 1);
       for (size_t probe_len = 0; probe_len <= longest_probe; probe_len++)
       {
@@ -308,8 +308,9 @@ namespace verona::rt
 
       assert(key_of(entry) != 0);
       const auto key = unmark_key(key_of(entry));
-      const auto hash = bits::hash((void*)key);
+      const auto hash = bits::hash(((const Object*)key)->id());
       auto index = hash & (capacity() - 1);
+      size_t iter_index = ~(size_t)0;
 
       for (uint8_t probe_len = 0; probe_len <= PROBE_MASK; probe_len++)
       {
@@ -320,7 +321,10 @@ namespace verona::rt
           if constexpr (!is_set)
             entry.second = std::forward<E>(entry).second;
 
-          return std::make_pair(false, Iterator(this, index));
+          if (iter_index == ~(size_t)0)
+            iter_index = index;
+
+          return std::make_pair(false, Iterator(this, iter_index));
         }
 
         if (k == 0)
@@ -328,11 +332,17 @@ namespace verona::rt
           place_entry(std::forward<E>(entry), index, probe_len);
           assert(!(key_of(slots[index]) & MARK_MASK));
           filled_slots++;
-          return std::make_pair(true, Iterator(this, index));
+          if (iter_index == ~(size_t)0)
+            iter_index = index;
+
+          return std::make_pair(true, Iterator(this, iter_index));
         }
 
         if (probe_index(k) < probe_len)
         { // Robin Hood time. Swap with current slot and continue.
+          if (iter_index == ~(size_t)0)
+            iter_index = index;
+
           Entry swap = std::move(slots[index]);
           place_entry(std::forward<E>(entry), index, probe_len);
           entry = swap;
@@ -345,7 +355,12 @@ namespace verona::rt
 
       // Maximum probe length reached, resize and retry.
       resize(alloc);
-      return insert(alloc, std::forward<E>(entry));
+      // Entry may have been swapped prior to resize.
+      auto it = insert(alloc, std::forward<E>(entry)).second;
+      if ((uintptr_t)it.key() != key)
+        it = find((const KeyType*)key);
+
+      return std::make_pair(true, std::move(it));
     }
 
     /**
@@ -414,7 +429,7 @@ namespace verona::rt
           out << " ∅";
           continue;
         }
-        out << " (" << (const KeyType*)unmark_key(key_of(slots[i]))
+        out << " (" << ((const KeyType*)unmark_key(key_of(slots[i])))->id()
             << ", probe " << (size_t)probe_index(key) << ")";
       }
       out << " } cap: " << capacity();

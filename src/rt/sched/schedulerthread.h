@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include "../object/object.h"
+#include "backpressure.h"
 #include "cpu.h"
+#include "ds/hashmap.h"
+#include "ds/mpscq.h"
+#include "object/object.h"
 #include "schedulerstats.h"
 #include "spmcq.h"
 #include "threadpool.h"
@@ -13,6 +16,19 @@
 
 namespace verona::rt
 {
+  /**
+   * There is typically one scheduler thread pinned to each physical CPU core.
+   * Each scheduler thread is responsible for running cowns in its queue and
+   * periodically stealing cowns from the queues of other scheduler threads.
+   * This periodic work stealing is done to fairly distribute work across the
+   * available scheduler threads. The period of work stealing for fairness is
+   * determined by a single token cown that will be dequeued once all cowns
+   * before it have been run. The removal of the token cown from the queue
+   * occurs at a rate inversely proportional to the amount of cowns pending work
+   * on that thread. A scheduler thread will enqueue a new token, if its
+   * previous one has been dequeued or stolen, once more work is scheduled on
+   * the scheduler thread.
+   */
   template<class T>
   class SchedulerThread
   {
@@ -83,13 +99,20 @@ namespace verona::rt
     size_t total_cowns = 0;
     std::atomic<size_t> free_cowns = 0;
 
+    ObjectMap<std::pair<T*, ObjectMap<T*>*>> mute_map;
+    typename T::MessageBody* message_body = nullptr;
+    T* mutor = nullptr;
+
     T* get_token_cown()
     {
       assert(token_cown);
       return token_cown;
     }
 
-    SchedulerThread() : token_cown{T::create_token_cown()}, q{token_cown}
+    SchedulerThread()
+    : token_cown{T::create_token_cown()},
+      q{token_cown},
+      mute_map{ThreadAlloc::get()}
     {
       token_cown->set_owning_thread(this);
     }
@@ -98,6 +121,8 @@ namespace verona::rt
     {
       if (t.joinable())
         t.join();
+
+      assert(mute_map.size() == 0);
     }
 
     template<typename... Args>
@@ -114,13 +139,13 @@ namespace verona::rt
 
     inline void schedule_fifo(T* a)
     {
-      Systematic::cout() << "Enqueued Cown: " << a << " ("
-                         << a->get_epoch_mark() << ")" << std::endl;
+      Systematic::cout() << "Enqueue cown: " << a << " (" << a->get_epoch_mark()
+                         << ")" << std::endl;
 
       // Scheduling on this thread, from this thread.
       if (!a->scanned(send_epoch))
       {
-        Systematic::cout() << "Enqueued Unscanned Cown: " << a << std::endl;
+        Systematic::cout() << "Enqueue unscanned cown: " << a << std::endl;
         scheduled_unscanned_cown = true;
       }
       assert(!a->queue.is_sleeping());
@@ -138,7 +163,7 @@ namespace verona::rt
     {
       // A lifo scheduled cown is coming from an external source, such as
       // asynchronous I/O.
-      Systematic::cout() << "LIFO Scheduled Cown: " << a << std::endl;
+      Systematic::cout() << "LIFO schedule cown: " << a << std::endl;
 
       q.enqueue_front(ThreadAlloc::get(), a);
       stats.lifo();
@@ -169,6 +194,105 @@ namespace verona::rt
     }
 
     /**
+     * Mute a set of cowns. This will add the cowns to the mute set of the
+     * mutor.
+     */
+    void mute(T** cowns, size_t count)
+    {
+      assert(mutor != nullptr);
+
+      auto it = mute_map.find(mutor);
+      if (it == mute_map.end())
+      {
+        auto* set = ObjectMap<T*>::create(alloc);
+        it = mute_map.insert(alloc, std::make_pair(mutor, set)).second;
+      }
+      else
+      {
+        mutor->weak_release(alloc);
+      }
+      auto& mute_set = *it.value();
+
+      for (size_t i = 0; i < count; i++)
+      {
+        auto* cown = cowns[i];
+        auto bp = cown->backpressure.load(std::memory_order_relaxed);
+        yield();
+        assert(!bp.muted());
+
+        if (
+          (bp.unmutable()) || (state == ThreadState::PreScan) ||
+          (state == ThreadState::Scan) || (state == ThreadState::AllInScan))
+        { // Messages in this cown's queue must be scanned.
+          cown->schedule();
+          continue;
+        }
+
+        yield();
+
+        auto bp_muted = bp;
+        bp_muted.set_state_muted();
+        auto ins = mute_set.insert(alloc, cown);
+        if (ins.first)
+          T::acquire(cown);
+
+        if (
+#ifdef USE_SYSTEMATIC_TESTING
+          Systematic::coin(9) ||
+#endif
+          !cown->backpressure.compare_exchange_weak(
+            bp, bp_muted, std::memory_order_acq_rel))
+        {
+          yield();
+          assert(!bp.muted());
+          cown->schedule();
+          mute_set.erase(ins.second);
+          if (ins.first)
+            T::release(alloc, cown);
+
+          continue;
+        }
+        Systematic::cout() << "Mute " << cown << std::endl;
+      }
+
+      alloc->dealloc(cowns, count * sizeof(T*));
+    }
+
+    /**
+     * Unmute all mute sets where the mutor is in a state that triggers
+     * unmuting. If `force` is true, then all mute sets in the map will be
+     * unmuted.
+     */
+    void mute_map_scan(bool force = false)
+    {
+      for (auto entry = mute_map.begin(); entry != mute_map.end(); ++entry)
+      {
+        auto* m = entry.key();
+        if (
+          force ||
+          m->backpressure.load(std::memory_order_acquire).triggers_unmuting())
+        {
+          yield();
+          auto& mute_set = *entry.value();
+          for (auto it = mute_set.begin(); it != mute_set.end(); ++it)
+          {
+            Systematic::cout() << "Mute map remove " << it.key() << std::endl;
+            it.key()->unmute();
+            T::release(alloc, it.key());
+            mute_set.erase(it);
+          }
+          m->weak_release(alloc);
+          mute_map.erase(entry);
+          mute_set.dealloc(alloc);
+          alloc->dealloc<sizeof(ObjectMap<T*>)>(&mute_set);
+        }
+      }
+
+      if (mute_map.size() == 0)
+        mute_map.clear(alloc);
+    }
+
+    /**
      * Startup is supplied to initialise thread local state before the runtime
      * starts.
      *
@@ -178,7 +302,6 @@ namespace verona::rt
     void run(void (*startup)(Args...), Args... args)
     {
       startup(args...);
-      // TODO: back-pressure
       // Don't use affinity with systematic testing.  We're only ever running
       // one thread at a time in systematic testing mode and by pinning each
       // thread to a core we massively increase contention.
@@ -200,7 +323,7 @@ namespace verona::rt
         if (
           (total_cowns < (free_cowns << 1))
 #ifdef USE_SYSTEMATIC_TESTING
-          || Scheduler::coin()
+          || Systematic::coin()
 #endif
         )
           collect_cown_stubs();
@@ -216,11 +339,13 @@ namespace verona::rt
 
         check_token_cown();
 
+        mute_map_scan();
+
         if (cown == nullptr)
         {
           cown = q.dequeue(alloc);
           if (cown != nullptr)
-            Systematic::cout() << "Popped cown:" << cown << std::endl;
+            Systematic::cout() << "Pop cown: " << cown << std::endl;
         }
 
         if (cown == nullptr)
@@ -232,7 +357,7 @@ namespace verona::rt
             break;
         }
 
-        Systematic::cout() << "Scheduled Cown: " << cown << " ("
+        Systematic::cout() << "Schedule cown: " << cown << " ("
                            << cown->get_epoch_mark() << ")" << std::endl;
 
         // Administrative work before handling messages.
@@ -257,7 +382,7 @@ namespace verona::rt
 
         ld_protocol();
 
-        Systematic::cout() << "Running Cown: " << cown << std::endl;
+        Systematic::cout() << "Running cown: " << cown << std::endl;
 
         bool reschedule = cown->run(alloc, state, send_epoch);
 
@@ -298,14 +423,14 @@ namespace verona::rt
                 }
               }
 
-              Systematic::cout() << "Rescheduling Cown: " << cown << " ("
+              Systematic::cout() << "Reschedule cown: " << cown << " ("
                                  << cown->get_epoch_mark() << ")" << std::endl;
             }
           }
         }
         else
         {
-          Systematic::cout() << "Unscheduling Cown: " << cown << std::endl;
+          Systematic::cout() << "Unschedule cown: " << cown << std::endl;
           // Don't reschedule.
           cown = nullptr;
         }
@@ -314,6 +439,8 @@ namespace verona::rt
         Scheduler::yield_my_turn();
 #endif
       }
+
+      assert(mute_map.size() == 0);
 
       Systematic::cout() << "Begin teardown (phase 1)" << std::endl;
 
@@ -354,7 +481,7 @@ namespace verona::rt
         if (cown != nullptr)
         {
           // stats.steal();
-          Systematic::cout() << "Fast-steal Cown: " << cown << " from "
+          Systematic::cout() << "Fast-steal cown: " << cown << " from "
                              << victim->systematic_id << std::endl;
           result = cown;
           return true;
@@ -426,7 +553,7 @@ namespace verona::rt
           if (cown != nullptr)
           {
             stats.steal();
-            Systematic::cout() << "Stole Cown: " << cown << " from "
+            Systematic::cout() << "Stole cown: " << cown << " from "
                                << victim->systematic_id << std::endl;
             return cown;
           }
@@ -449,8 +576,13 @@ namespace verona::rt
           UNUSED(tsc);
         }
 #endif
-          // Enter sleep only when the queue doesn't contain any real cowns.
-          if (state == ThreadState::NotInLD && q.is_empty())
+          if (mute_map.size() != 0)
+        {
+          mute_map_scan(true);
+          continue;
+        }
+        // Enter sleep only when the queue doesn't contain any real cowns.
+        else if (state == ThreadState::NotInLD && q.is_empty())
         {
           // We've been spinning looking for work for some time. While paused,
           // our running flag may be set to false, in which case we terminate.
@@ -460,7 +592,7 @@ namespace verona::rt
 #ifdef USE_SYSTEMATIC_TESTING
         else
         {
-          Scheduler::yield_my_turn();
+          yield();
         }
 #endif
       }
@@ -514,7 +646,7 @@ namespace verona::rt
       // registered with a scheduler thread.
       if (cown->owning_thread() == nullptr)
       {
-        Systematic::cout() << "Bind cown " << this << " to scheduler thread."
+        Systematic::cout() << "Bind cown to scheduler thread: " << this
                            << std::endl;
         cown->set_owning_thread(this);
         cown->next = list;
@@ -695,8 +827,10 @@ namespace verona::rt
       Systematic::cout() << "send_epoch (2): " << send_epoch << std::endl;
 
       // Send empty messages to all cowns that can be LIFO scheduled.
-      T* p = list;
 
+      mute_map_scan(true);
+
+      T* p = list;
       while (p != nullptr)
       {
         if (p->can_lifo_schedule())
