@@ -7,6 +7,8 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/StandardTypes.h"
 
+#include "llvm/ADT/TypeSwitch.h"
+
 namespace mlir::verona::detail
 {
   struct MeetTypeStorage : public TypeStorage
@@ -115,7 +117,7 @@ namespace mlir::verona
   MeetType MeetType::get(MLIRContext* ctx, llvm::ArrayRef<mlir::Type> elements)
   {
     assert(areVeronaTypes(elements));
-    return Base::get(ctx, VeronaTypes::Meet, elements);
+    return Base::get(ctx, elements);
   }
 
   llvm::ArrayRef<mlir::Type> MeetType::getElements() const
@@ -126,7 +128,7 @@ namespace mlir::verona
   JoinType JoinType::get(MLIRContext* ctx, llvm::ArrayRef<mlir::Type> elements)
   {
     assert(areVeronaTypes(elements));
-    return Base::get(ctx, VeronaTypes::Join, elements);
+    return Base::get(ctx, elements);
   }
 
   llvm::ArrayRef<mlir::Type> JoinType::getElements() const
@@ -136,7 +138,7 @@ namespace mlir::verona
 
   IntegerType IntegerType::get(MLIRContext* ctx, size_t width, unsigned sign)
   {
-    return Base::get(ctx, VeronaTypes::Integer, width, sign);
+    return Base::get(ctx, width, sign);
   }
 
   size_t IntegerType::getWidth() const
@@ -151,7 +153,7 @@ namespace mlir::verona
 
   CapabilityType CapabilityType::get(MLIRContext* ctx, Capability cap)
   {
-    return Base::get(ctx, VeronaTypes::Capability, cap);
+    return Base::get(ctx, cap);
   }
 
   Capability CapabilityType::getCapability() const
@@ -257,12 +259,9 @@ namespace mlir::verona
 
   void printVeronaType(Type type, DialectAsmPrinter& os)
   {
-    switch (type.getKind())
-    {
-      case VeronaTypes::Integer:
-      {
-        auto iTy = type.cast<IntegerType>();
-        if (iTy.getSign())
+    TypeSwitch<Type>(type)
+      .Case<IntegerType>([&](IntegerType type) {
+        if (type.getSign())
         {
           os << "S";
         }
@@ -270,44 +269,32 @@ namespace mlir::verona
         {
           os << "U";
         }
-        os << iTy.getWidth();
-        break;
-      }
-
-      case VeronaTypes::Meet:
-      {
-        auto meetType = type.cast<MeetType>();
-        if (meetType.getElements().empty())
+        os << type.getWidth();
+      })
+      .Case<MeetType>([&](MeetType type) {
+        if (type.getElements().empty())
         {
           os << "top";
         }
         else
         {
           os << "meet";
-          printTypeList(meetType.getElements(), os);
+          printTypeList(type.getElements(), os);
         }
-        break;
-      }
-
-      case VeronaTypes::Join:
-      {
-        auto joinType = type.cast<JoinType>();
-        if (joinType.getElements().empty())
+      })
+      .Case<JoinType>([&](JoinType type) {
+        if (type.getElements().empty())
         {
           os << "bottom";
         }
         else
         {
           os << "join";
-          printTypeList(joinType.getElements(), os);
+          printTypeList(type.getElements(), os);
         }
-        break;
-      }
-
-      case VeronaTypes::Capability:
-      {
-        auto capType = type.cast<CapabilityType>();
-        switch (capType.getCapability())
+      })
+      .Case<CapabilityType>([&](CapabilityType type) {
+        switch (type.getCapability())
         {
           case Capability::Isolated:
             os << "iso";
@@ -319,15 +306,12 @@ namespace mlir::verona
             os << "imm";
             break;
         }
-        break;
-      }
-    }
+      });
   }
 
   bool isaVeronaType(Type type)
   {
-    return type.getKind() >= FIRST_VERONA_TYPE &&
-      type.getKind() < LAST_VERONA_TYPE;
+    return type.isa<MeetType, JoinType, IntegerType, CapabilityType>();
   }
 
   bool areVeronaTypes(llvm::ArrayRef<Type> types)
@@ -442,21 +426,13 @@ namespace mlir::verona
   {
     MLIRContext* ctx = type.getContext();
     assert(isaVeronaType(type));
-    switch (type.getKind())
-    {
-      // These don't contain any nested types and need no expansion.
-      case VeronaTypes::Integer:
-      case VeronaTypes::Capability:
-        return type;
-
-      case VeronaTypes::Join:
+    return TypeSwitch<Type, Type>(type)
+      .Case<JoinType>([&](Type type) {
         return normalizeJoin(ctx, type.cast<JoinType>().getElements());
-
-      case VeronaTypes::Meet:
+      })
+      .Case<MeetType>([&](Type type) {
         return normalizeMeet(ctx, type.cast<MeetType>().getElements());
-
-      default:
-        llvm_unreachable("invalid Verona type");
-    }
+      })
+      .Default([&](Type type) { return type; });
   }
 }

@@ -175,6 +175,8 @@ set(CMAKE_CONFIGURATION_TYPES  Release Debug RelWithDebInfo)
 message(STATUS "Build types ${CMAKE_CONFIGURATION_TYPES}")
 
 if (VERONA_CI_BUILD)
+  # Specify policy to go into child projects.
+  set (CMAKE_POLICY_DEFAULT_CMP0077 NEW)
   set (SNMALLOC_CI_BUILD ON)
 endif ()
 
@@ -220,9 +222,9 @@ if(MSVC)
   add_compile_options(/wd4307)
 endif()
 
-add_subdirectory(external/CLI11)
-add_subdirectory(external/fmt)
-add_subdirectory(external/pegmatite)
+add_subdirectory(external/CLI11 EXCLUDE_FROM_ALL)
+add_subdirectory(external/fmt EXCLUDE_FROM_ALL)
+add_subdirectory(external/pegmatite EXCLUDE_FROM_ALL)
 
 add_library(cpp-peglib INTERFACE)
 target_include_directories(cpp-peglib INTERFACE external/cpp-peglib)

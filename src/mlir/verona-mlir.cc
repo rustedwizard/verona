@@ -8,7 +8,6 @@
 #include "ast/prec.h"
 #include "ast/ref.h"
 #include "ast/sym.h"
-#include "dialect/VeronaDialect.h"
 #include "driver.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllPasses.h"
@@ -102,12 +101,6 @@ namespace
 
 int main(int argc, char** argv)
 {
-  // MLIR boilerplace
-  mlir::registerAllDialects();
-  mlir::registerAllPasses();
-  // TODO: Register verona passes here.
-  mlir::registerDialect<mlir::verona::VeronaDialect>();
-
   // Set up pretty-print signal handlers
   llvm::InitLLVM y(argc, argv);
 
