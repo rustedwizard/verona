@@ -21,7 +21,15 @@ void VeronaDialect::initialize()
 #include "dialect/VeronaOps.cpp.inc"
     >();
 
-  addTypes<MeetType, JoinType, IntegerType, CapabilityType>();
+  addTypes<
+    MeetType,
+    JoinType,
+    IntegerType,
+    CapabilityType,
+    ClassType,
+    FloatType,
+    BoolType,
+    ViewpointType>();
 
   allowUnknownOperations();
   allowUnknownTypes();
