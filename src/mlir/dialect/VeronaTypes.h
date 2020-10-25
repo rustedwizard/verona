@@ -41,11 +41,15 @@ namespace mlir::verona
     struct JoinTypeStorage;
     struct IntegerTypeStorage;
     struct FloatTypeStorage;
+    struct DescriptorTypeStorage;
     struct CapabilityTypeStorage;
     struct ClassTypeStorage;
     struct ViewpointTypeStorage;
   }
 
+  /**
+   * Meet types are intersections between types (A & B).
+   */
   struct MeetType
   : public Type::TypeBase<MeetType, Type, detail::MeetTypeStorage>
   {
@@ -55,6 +59,9 @@ namespace mlir::verona
     llvm::ArrayRef<mlir::Type> getElements() const;
   };
 
+  /**
+   * Join types are unions between types (A | B).
+   */
   struct JoinType
   : public Type::TypeBase<JoinType, Type, detail::JoinTypeStorage>
   {
@@ -64,32 +71,29 @@ namespace mlir::verona
     llvm::ArrayRef<mlir::Type> getElements() const;
   };
 
-  struct IntegerType
-  : public Type::TypeBase<IntegerType, Type, detail::IntegerTypeStorage>
+  /**
+   * Unknown types are derived types from operations that cannot define the type
+   * at lowering stage, but will later be replaced by other types during type
+   * inference.
+   */
+  struct UnknownType : public Type::TypeBase<UnknownType, Type, TypeStorage>
   {
     using Base::Base;
 
-    static IntegerType get(MLIRContext* context, size_t width, unsigned sign);
-
-    size_t getWidth() const;
-    bool getSign() const;
+    static UnknownType get(MLIRContext* context);
   };
 
-  struct FloatType
-  : public Type::TypeBase<FloatType, Type, detail::FloatTypeStorage>
+  /**
+   * A static class descriptor type, used for access to static members of the
+   * class, including fields and methods.
+   */
+  struct DescriptorType
+  : public Type::TypeBase<DescriptorType, Type, detail::DescriptorTypeStorage>
   {
     using Base::Base;
 
-    static FloatType get(MLIRContext* context, size_t width);
-
-    size_t getWidth() const;
-  };
-
-  struct BoolType : public Type::TypeBase<BoolType, Type, TypeStorage>
-  {
-    using Base::Base;
-
-    static BoolType get(MLIRContext* context);
+    static DescriptorType get(MLIRContext* context, Type ref);
+    Type getDescribedType() const;
   };
 
   enum class Capability
@@ -99,6 +103,17 @@ namespace mlir::verona
     Immutable,
   };
 
+  /**
+   * Capability types represents properties of individual references eg.
+   * a `String & imm` and a `String & mut` could point to the same object.
+   *
+   * Isolated: An entry point to a new region. There can be more than one
+   * reference to the entrypoint, but only one of them can be Isolated ie.
+   * the others must be Mutable.
+   *
+   * Immutable: A stronger property than Read-Only. It guarantees that no
+   * mutable aliases to that object exist anywhere else.
+   */
   struct CapabilityType
   : public Type::TypeBase<CapabilityType, Type, detail::CapabilityTypeStorage>
   {
@@ -177,6 +192,12 @@ namespace mlir::verona
     Type getFieldType(StringRef name) const;
   };
 
+  /**
+   * Viewpoint is a view of a type through another type.
+   *
+   * For examples, reading a mut field from a imm object gives you a
+   * viewpoint<mut, imm> = imm reference.
+   */
   struct ViewpointType
   : public Type::TypeBase<ViewpointType, Type, detail::ViewpointTypeStorage>
   {

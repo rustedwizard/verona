@@ -4,6 +4,8 @@
 #pragma once
 
 #include "ast/ast.h"
+#include "dialect/VeronaOps.h"
+#include "dialect/VeronaTypes.h"
 #include "error.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Function.h"
@@ -122,10 +124,8 @@ namespace mlir::verona
     Generator(MLIRContext* context)
     : context(context), builder(context), unkLoc(builder.getUnknownLoc())
     {
-      // Initialise known opaque types, for comparison.
-      // TODO: Use Verona dialect types directly and isA<>.
-      allocaTy = genOpaqueType("alloca");
-      unkTy = genOpaqueType("unk");
+      // Initialise boolean / unknown types for convenience coding
+      unkTy = UnknownType::get(context);
       boolTy = builder.getI1Type();
     }
 
@@ -152,8 +152,6 @@ namespace mlir::verona
     /// Nested reference for head/exit blocks in loops.
     BasicBlockTableT loopTable;
 
-    /// Alloca types, before we start using Verona types with known sizes.
-    mlir::Type allocaTy;
     /// Unknown types, will be defined during type inference.
     mlir::Type unkTy;
     /// MLIR boolean type (int1).
@@ -166,16 +164,6 @@ namespace mlir::verona
     /// Get location of an ast node.
     mlir::Location getLocation(const ::ast::Ast& ast);
 
-    /// Declares a new variable.
-    void declareVariable(llvm::StringRef name, mlir::Value val);
-    /// Updates an existing variable in the local context.
-    void updateVariable(llvm::StringRef name, mlir::Value val);
-    /// Declare a (compiler generated) function.
-    void declareFunction(
-      llvm::StringRef name,
-      llvm::ArrayRef<llvm::StringRef> types,
-      llvm::StringRef retTy);
-
     // ================================================================= Parsers
     // These methods parse the AST into MLIR constructs, then either return the
     // expected MLIR value or call the generators (see below) to do that for
@@ -186,6 +174,9 @@ namespace mlir::verona
 
     /// Parses a function, from a top-level (module) view.
     llvm::Expected<mlir::FuncOp> parseFunction(const ::ast::Ast& ast);
+    /// Parse a class declaration
+    llvm::Expected<ModuleOp>
+    parseClass(const ::ast::Ast& ast, mlir::Type parent = mlir::Type());
 
     /// Recursive type parser, gathers all available information on the type
     /// and sub-types, modifiers, annotations, etc.
@@ -215,12 +206,19 @@ namespace mlir::verona
     llvm::Expected<ReturnValue> parseBreak(const ::ast::Ast& ast);
     /// Parses a 'return' statement.
     llvm::Expected<ReturnValue> parseReturn(const ::ast::Ast& ast);
+    /// Parses a 'new' statement.
+    llvm::Expected<ReturnValue> parseNew(const ::ast::Ast& ast);
+    /// Parses a '.' statement for reading.
+    llvm::Expected<ReturnValue> parseFieldRead(const ::ast::Ast& ast);
+    /// Parses a '.' statement for writing.
+    llvm::Expected<ReturnValue>
+    parseFieldWrite(const ::ast::Ast& ast, mlir::Value value);
 
     // ============================================================== Generators
     // These methods build complex MLIR constructs from parameters either
     // acquired from the AST or built by the compiler as to mimic the AST.
 
-    /// Generate a Verona type from parsing its name.
+    /// Generate a Verona type from parsing its name, caching in the typeTable.
     mlir::Type generateType(llvm::StringRef name);
     /// Generate a prototype, populating the symbol table
     llvm::Expected<mlir::FuncOp> generateProto(
@@ -258,10 +256,8 @@ namespace mlir::verona
     /// Generates a verona constant with opaque type
     mlir::Value generateConstant(
       mlir::Location loc, llvm::StringRef value, llvm::StringRef typeName);
-    /// Generates a verona alloca with special type (or allocaTy if none)
-    // TODO: use defining operation instead of a special type, default to unkTy
-    mlir::Value
-    generateAlloca(mlir::Location loc, llvm::StringRef typeName = "");
+    /// Generates a verona alloca with specific type
+    mlir::Value generateAlloca(mlir::Location loc, mlir::Type type);
     /// Generates a verona load (using address' type, or unkTy)
     mlir::Value generateLoad(mlir::Location loc, mlir::Value addr);
     /// Generates a verona store (using value's type, or unkTy)
@@ -277,8 +273,5 @@ namespace mlir::verona
       llvm::StringRef name,
       llvm::ArrayRef<mlir::Value> ops,
       mlir::Type retTy);
-
-    /// Wrappers for opaque types before we use actual Verona dialect.
-    mlir::OpaqueType genOpaqueType(llvm::StringRef name);
   };
 }

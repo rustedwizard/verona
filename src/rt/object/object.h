@@ -77,7 +77,7 @@ namespace verona::rt
   class Object;
   class RegionBase;
 
-  using ObjectStack = Stack<Object*, Alloc>;
+  using ObjectStack = Stack<Object, Alloc>;
   static constexpr size_t descriptor_alignment =
     snmalloc::bits::min<size_t>(8, alignof(void*));
 
@@ -140,7 +140,7 @@ namespace verona::rt
       case EpochMark::SCANNED:
         return os << "SCANNED";
       default:
-        return os;
+        abort();
     }
   }
 
@@ -190,9 +190,16 @@ namespace verona::rt
         case RegionMD::COWN:
           return os << "COWN";
         default:
-          return os;
+          abort();
       }
     }
+
+#ifdef USE_SYSTEMATIC_TESTING
+    inline friend std::ostream& operator<<(std::ostream& os, const Object* o)
+    {
+      return os << o->id<false>();
+    }
+#endif
 
     // Note that while we only need 3 bits, we need to reserve enough bits
     // for the hashmap implementation. A static assert in hashmap.h should
@@ -275,6 +282,8 @@ namespace verona::rt
       }
 
       previous = value;
+#else
+      UNUSED(value);
 #endif
     }
 
@@ -322,10 +331,14 @@ namespace verona::rt
     }
 #endif
 
+    template<bool scramble = true>
     inline uintptr_t id() const
     {
 #ifdef USE_SYSTEMATIC_TESTING
-      return Systematic::get_scrambler().perm(sys_id);
+      if constexpr (scramble)
+        return Systematic::get_scrambler().perm(sys_id);
+      else
+        return sys_id;
 #else
       return (uintptr_t)this;
 #endif

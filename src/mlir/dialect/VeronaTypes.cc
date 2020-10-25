@@ -56,53 +56,23 @@ namespace mlir::verona::detail
     }
   };
 
-  struct IntegerTypeStorage : public TypeStorage
+  struct DescriptorTypeStorage : public TypeStorage
   {
-    uint8_t width;
-    enum SignType
-    {
-      Unknown,
-      Unsigned,
-      Signed
-    };
-    unsigned sign;
+    Type describedType;
 
-    // width, sign
-    using KeyTy = std::tuple<size_t, unsigned>;
-    IntegerTypeStorage(const KeyTy& key)
-    : width(std::get<0>(key)), sign(std::get<1>(key))
-    {}
+    using KeyTy = Type;
+    DescriptorTypeStorage(const KeyTy& key) : describedType(key) {}
 
     bool operator==(const KeyTy& key) const
     {
-      return key == KeyTy(width, sign);
+      return key == KeyTy(describedType);
     }
 
-    static IntegerTypeStorage*
+    static DescriptorTypeStorage*
     construct(TypeStorageAllocator& allocator, const KeyTy& key)
     {
-      return new (allocator.allocate<IntegerTypeStorage>())
-        IntegerTypeStorage(key);
-    }
-  };
-
-  struct FloatTypeStorage : public TypeStorage
-  {
-    uint8_t width;
-
-    // width
-    using KeyTy = size_t;
-    FloatTypeStorage(const KeyTy& key) : width(key) {}
-
-    bool operator==(const KeyTy& key) const
-    {
-      return key == KeyTy(width);
-    }
-
-    static FloatTypeStorage*
-    construct(TypeStorageAllocator& allocator, const KeyTy& key)
-    {
-      return new (allocator.allocate<FloatTypeStorage>()) FloatTypeStorage(key);
+      return new (allocator.allocate<DescriptorTypeStorage>())
+        DescriptorTypeStorage(key);
     }
   };
 
@@ -244,34 +214,19 @@ namespace mlir::verona
     return getImpl()->elements;
   }
 
-  IntegerType IntegerType::get(MLIRContext* ctx, size_t width, unsigned sign)
+  UnknownType UnknownType::get(MLIRContext* ctx)
   {
-    return Base::get(ctx, width, sign);
+    return ::mlir::detail::TypeUniquer::get<UnknownType>(ctx);
   }
 
-  size_t IntegerType::getWidth() const
+  DescriptorType DescriptorType::get(MLIRContext* ctx, Type describedType)
   {
-    return getImpl()->width;
+    return Base::get(ctx, describedType);
   }
 
-  bool IntegerType::getSign() const
+  Type DescriptorType::getDescribedType() const
   {
-    return getImpl()->sign;
-  }
-
-  FloatType FloatType::get(MLIRContext* ctx, size_t width)
-  {
-    return Base::get(ctx, width);
-  }
-
-  size_t FloatType::getWidth() const
-  {
-    return getImpl()->width;
-  }
-
-  BoolType BoolType::get(MLIRContext* ctx)
-  {
-    return ::mlir::detail::TypeUniquer::get<BoolType>(ctx);
+    return getImpl()->describedType;
   }
 
   CapabilityType CapabilityType::get(MLIRContext* ctx, Capability cap)
@@ -311,8 +266,12 @@ namespace mlir::verona
 
   ClassType::FieldsRef ClassType::getFields() const
   {
-    assert(getImpl()->isInitialized);
-    return getImpl()->fields;
+    // We may not have a full declaration available
+    // TODO: Make this an assert when we have modules
+    if (getImpl()->isInitialized)
+      return getImpl()->fields;
+    else
+      return ClassType::FieldsRef();
   }
 
   Type ClassType::getFieldType(StringRef name) const
@@ -345,11 +304,10 @@ namespace mlir::verona
     return type.isa<
       MeetType,
       JoinType,
-      IntegerType,
+      UnknownType,
+      DescriptorType,
       CapabilityType,
       ClassType,
-      FloatType,
-      BoolType,
       ViewpointType>();
   }
 

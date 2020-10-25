@@ -139,13 +139,13 @@ namespace verona::rt
 
     inline void schedule_fifo(T* a)
     {
-      Systematic::cout() << "Enqueue cown: " << a << " (" << a->get_epoch_mark()
+      Systematic::cout() << "Enqueue cown " << a << " (" << a->get_epoch_mark()
                          << ")" << std::endl;
 
       // Scheduling on this thread, from this thread.
       if (!a->scanned(send_epoch))
       {
-        Systematic::cout() << "Enqueue unscanned cown: " << a << std::endl;
+        Systematic::cout() << "Enqueue unscanned cown " << a << std::endl;
         scheduled_unscanned_cown = true;
       }
       assert(!a->queue.is_sleeping());
@@ -163,7 +163,7 @@ namespace verona::rt
     {
       // A lifo scheduled cown is coming from an external source, such as
       // asynchronous I/O.
-      Systematic::cout() << "LIFO schedule cown: " << a << std::endl;
+      Systematic::cout() << "LIFO schedule cown " << a << std::endl;
 
       q.enqueue_front(ThreadAlloc::get(), a);
       stats.lifo();
@@ -218,12 +218,11 @@ namespace verona::rt
         auto* cown = cowns[i];
         auto bp = cown->bp_state.load(std::memory_order_relaxed);
         yield();
-        assert(bp != BackpressureState::Muted);
+        assert(bp != Priority::Low);
 
         if (
-          (bp & BackpressureState::IsUnmutable) ||
-          (state == ThreadState::PreScan) || (state == ThreadState::Scan) ||
-          (state == ThreadState::AllInScan))
+          (bp & PriorityMask::High) || (state == ThreadState::PreScan) ||
+          (state == ThreadState::Scan) || (state == ThreadState::AllInScan))
         { // Messages in this cown's queue must be scanned.
           cown->schedule();
           continue;
@@ -240,20 +239,19 @@ namespace verona::rt
           Systematic::coin(9) ||
 #endif
           !cown->bp_state.compare_exchange_weak(
-            bp, BackpressureState::Muted, std::memory_order_acq_rel))
+            bp, Priority::Low, std::memory_order_acq_rel))
         {
           yield();
-          assert(bp != BackpressureState::Muted);
+          assert(bp != Priority::Low);
           cown->schedule();
           mute_set.erase(ins.second);
-          if (ins.first)
-            T::release(alloc, cown);
+          T::release(alloc, cown);
 
           continue;
         }
-        Systematic::cout() << "Cown " << this << ": backpressure state " << bp
-                           << " -> Muted" << std::endl;
-        assert(!(bp & BackpressureState::IsUnmutable));
+        Systematic::cout() << "Cown " << cown << ": backpressure state " << bp
+                           << " -> Low" << std::endl;
+        assert(!(bp & PriorityMask::High));
       }
 
       alloc->dealloc(cowns, count * sizeof(T*));
@@ -269,14 +267,15 @@ namespace verona::rt
       for (auto entry = mute_map.begin(); entry != mute_map.end(); ++entry)
       {
         auto* m = entry.key();
-        if (force || m->triggers_unmuting())
+        if (force || !m->triggers_muting())
         {
           yield();
           auto& mute_set = *entry.value();
           for (auto it = mute_set.begin(); it != mute_set.end(); ++it)
           {
-            Systematic::cout() << "Mute map remove " << it.key() << std::endl;
-            it.key()->unmute();
+            Systematic::cout()
+              << "Mute map remove cown " << it.key() << std::endl;
+            it.key()->backpressure_transition(Priority::Normal);
             T::release(alloc, it.key());
             mute_set.erase(it);
           }
@@ -344,7 +343,7 @@ namespace verona::rt
         {
           cown = q.dequeue(alloc);
           if (cown != nullptr)
-            Systematic::cout() << "Pop cown: " << cown << std::endl;
+            Systematic::cout() << "Pop cown " << cown << std::endl;
         }
 
         if (cown == nullptr)
@@ -356,15 +355,15 @@ namespace verona::rt
             break;
         }
 
-        Systematic::cout() << "Schedule cown: " << cown << " ("
-                           << cown->get_epoch_mark() << ")" << std::endl;
-
         // Administrative work before handling messages.
         if (!prerun(cown))
         {
           cown = nullptr;
           continue;
         }
+
+        Systematic::cout() << "Schedule cown " << cown << " ("
+                           << cown->get_epoch_mark() << ")" << std::endl;
 
         // This prevents the LD protocol advancing if this cown has not been
         // scanned. This catches various cases where we have stolen, or
@@ -381,7 +380,7 @@ namespace verona::rt
 
         ld_protocol();
 
-        Systematic::cout() << "Running cown: " << cown << std::endl;
+        Systematic::cout() << "Running cown " << cown << std::endl;
 
         bool reschedule = cown->run(alloc, state, send_epoch);
 
@@ -422,14 +421,18 @@ namespace verona::rt
                 }
               }
 
-              Systematic::cout() << "Reschedule cown: " << cown << " ("
-                                 << cown->get_epoch_mark() << ")" << std::endl;
+              if (!has_thread_bit(cown))
+              {
+                Systematic::cout()
+                  << "Reschedule cown " << cown << " ("
+                  << cown->get_epoch_mark() << ")" << std::endl;
+              }
             }
           }
         }
         else
         {
-          Systematic::cout() << "Unschedule cown: " << cown << std::endl;
+          Systematic::cout() << "Unschedule cown " << cown << std::endl;
           // Don't reschedule.
           cown = nullptr;
         }
@@ -480,7 +483,7 @@ namespace verona::rt
         if (cown != nullptr)
         {
           // stats.steal();
-          Systematic::cout() << "Fast-steal cown: " << cown << " from "
+          Systematic::cout() << "Fast-steal cown " << cown << " from "
                              << victim->systematic_id << std::endl;
           result = cown;
           return true;
@@ -552,7 +555,7 @@ namespace verona::rt
           if (cown != nullptr)
           {
             stats.steal();
-            Systematic::cout() << "Stole cown: " << cown << " from "
+            Systematic::cout() << "Stole cown " << cown << " from "
                                << victim->systematic_id << std::endl;
             return cown;
           }
@@ -882,14 +885,14 @@ namespace verona::rt
         {
           if (c->weak_count != 0)
           {
-            Systematic::cout() << "Leaking cown: " << c << std::endl;
+            Systematic::cout() << "Leaking cown " << c << std::endl;
             if (Scheduler::get_detect_leaks())
             {
               *p = c->next;
               continue;
             }
           }
-          Systematic::cout() << "Stub collect: " << c << std::endl;
+          Systematic::cout() << "Stub collect cown " << c << std::endl;
           // TODO: Investigate systematic testing coverage here.
           auto epoch = c->epoch_when_popped;
           auto outdated =
@@ -898,8 +901,8 @@ namespace verona::rt
           {
             count++;
             *p = c->next;
+            Systematic::cout() << "Stub collected cown " << c << std::endl;
             c->dealloc(alloc);
-            Systematic::cout() << "Stub collected: " << c << std::endl;
             continue;
           }
           else

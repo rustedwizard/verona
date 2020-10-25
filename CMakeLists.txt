@@ -27,12 +27,21 @@ macro(clangformat_targets)
   # If we've found a clang-format tool, generate a target for it, otherwise emit
   # a warning.
   if (${CLANG_FORMAT} STREQUAL "CLANG_FORMAT-NOTFOUND")
-    message(WARNING "Not generating clangformat target, no clang-format tool found")
+    message(WARNING "Not generating clangformat target, must have clang-format-9 in the PATH")
   else ()
     message(STATUS "Generating clangformat target using ${CLANG_FORMAT}")
-    file(GLOB_RECURSE ALL_SOURCE_FILES src/*.cc src/*.h src/*.hh)
+    find_package(Git)
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} ls-files *.cc *.h
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/"
+      OUTPUT_VARIABLE ALL_SOURCE_FILES_STRING
+    )
+
+    string(REPLACE "\n" ";" ALL_SOURCE_FILES ${ALL_SOURCE_FILES_STRING})
+
     add_custom_target(
       clangformat
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/"
       COMMAND ${CLANG_FORMAT}
       -i
       ${ALL_SOURCE_FILES})

@@ -4,6 +4,7 @@
 
 #include "interpreter/convert.h"
 #include "interpreter/format.h"
+#include "interpreter/value_list.h"
 
 #include <fmt/ranges.h>
 
@@ -21,16 +22,19 @@ namespace verona::interpreter
     // First argument is the receiver, followed by cown_count cowns that are
     // being acquired, followed by captures. The cowns need to be transformed
     // so we actually pass their contents to the behaviour instead.
-    size_t index = 0;
-    for (auto& a : args)
+    for (size_t i = 0; i < args.size(); i++)
     {
-      if (index > 0 && index <= cown_count)
+      Register reg(truncate<uint8_t>(i));
+      Value& value = args[i];
+      if (i > 0 && i <= cown_count)
       {
-        a.switch_to_cown_body();
+        write(reg, value.cown_body());
+        value.clear(alloc_);
       }
-      stack_.at(index).overwrite(alloc_, std::move(a));
-
-      index++;
+      else
+      {
+        write(reg, std::move(value));
+      }
     }
 
     dispatch_loop();
@@ -270,6 +274,14 @@ namespace verona::interpreter
     return Value();
   }
 
+  void VM::opcode_clear_list(ValueList values)
+  {
+    for (Value& value : values)
+    {
+      value.clear(alloc_);
+    }
+  }
+
   void VM::opcode_fulfill_sleeping_cown(const Value& cown, Value result)
   {
     check_type(cown, Value::COWN);
@@ -414,13 +426,12 @@ namespace verona::interpreter
     rt::RegionTrace::gc(alloc_, region);
   }
 
-  void VM::opcode_print(std::string_view fmt, uint8_t argc)
+  void VM::opcode_print(std::string_view fmt, ConstValueList values)
   {
     fmt::dynamic_format_arg_store<fmt::format_context> store;
-    for (uint8_t i = 0; i < argc; i++)
+    for (const Value& value : values)
     {
-      Register reg = code_.load<Register>(frame().ip);
-      store.push_back(std::cref(read(reg)));
+      store.push_back(std::cref(value));
     }
     fmt::vprint(fmt, store);
   }
@@ -508,8 +519,9 @@ namespace verona::interpreter
         header.argc);
     }
 
-    size_t top = frame().base + frame().locals;
-    Value* values = &stack_[top - callspace + 1];
+    // Compute the base of the new "frame", relative to the current frame.
+    // We use this to copy these values into the message
+    size_t base = frame().locals - callspace;
 
     // Prepare the cowns and the arguments for the method invocation.
     std::vector<Value> args;
@@ -523,23 +535,28 @@ namespace verona::interpreter
     // The rest are the cowns
     for (size_t i = 0; i < cown_count; i++)
     {
-      Value& v = values[i];
+      Value& v = read(Register(truncate<uint8_t>(base + 1 + i)));
       trace("Capturing cown {:d}: {}", i, v);
       check_type(v, Value::COWN);
 
-      // Multimessage will take increfs on all the cowns, so don't need to
-      // protect them here.
-      cowns.push_back(v->cown);
-      // Releases reference count to caller, so we can use it inside
-      // multi-message.
-      v.consume_cown();
-      args.push_back(std::move(v));
+      // Push the body of the cown into the message, as an unowned cown. The
+      // runtime will be holding a reference to the cown for us, so no need to
+      // have our own.
+      //
+      // We can't look up the pointer to the cown's contents, since for promise
+      // cowns it is not set until the promise is fulfilled.
+      args.push_back(v.as_unowned_cown());
+
+      // Transfer ownership of the cown from `v` into the `cowns` vector. The
+      // runtime will hold on to the references until after the message is
+      // executed.
+      cowns.push_back(v.consume_cown());
     }
 
     // The rest are the captured values
     for (size_t i = 0; i < capture_count; i++)
     {
-      Value& v = values[i + cown_count];
+      Value& v = read(Register(truncate<uint8_t>(base + 1 + cown_count + i)));
       trace("Capturing variable {:d}: {}", i + cown_count, v);
       args.push_back(std::move(v));
     }
@@ -555,6 +572,38 @@ namespace verona::interpreter
 
     rt::Cown::schedule<ExecuteMessage, rt::YesTransfer>(
       cowns.size(), cowns.data(), entry_addr, std::move(args), cown_count);
+  }
+
+  void VM::opcode_protect(ConstValueList values)
+  {
+    for (const Value& value : values)
+    {
+      // Only MUTs need to be protected against GC. ISOs are the entrypoint to
+      // the region, hence are always traced. IMM and COWNs hold reference
+      // counts to their object. The rest aren't managed by the runtime.
+      if (value.tag == Value::MUT)
+      {
+        VMObject* object = value->object;
+        VMObject* region = object->region();
+        rt::RegionTrace::push_additional_root(region, object, alloc_);
+      }
+    }
+  }
+
+  void VM::opcode_unprotect(ConstValueList values)
+  {
+    // We iterate over the values in reverse order, in accordance with the stack
+    // API exposed by the runtime.
+    for (auto it = values.rbegin(); it != values.rend(); ++it)
+    {
+      const Value& value = *it;
+      if (value.tag == Value::MUT)
+      {
+        VMObject* object = value->object;
+        VMObject* region = object->region();
+        rt::RegionTrace::pop_additional_root(region, object, alloc_);
+      }
+    }
   }
 
   void VM::opcode_unreachable()
@@ -574,6 +623,7 @@ namespace verona::interpreter
       OP(BinOp, opcode_binop);
       OP(Call, opcode_call);
       OP(Clear, opcode_clear);
+      OP(ClearList, opcode_clear_list);
       OP(Copy, opcode_copy);
       OP(FulfillSleepingCown, opcode_fulfill_sleeping_cown);
       OP(Freeze, opcode_freeze);
@@ -590,11 +640,13 @@ namespace verona::interpreter
       OP(NewSleepingCown, opcode_new_sleeping_cown);
       OP(NewCown, opcode_new_cown);
       OP(Print, opcode_print);
+      OP(Protect, opcode_protect);
       OP(Return, opcode_return);
       OP(Store, opcode_store);
       OP(String, opcode_string);
       OP(TraceRegion, opcode_trace_region);
       OP(When, opcode_when);
+      OP(Unprotect, opcode_unprotect);
       OP(Unreachable, opcode_unreachable);
 
 #undef OP

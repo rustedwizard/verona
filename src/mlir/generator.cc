@@ -3,7 +3,6 @@
 
 #include "generator.h"
 
-#include "abi.h"
 #include "ast-utils.h"
 #include "dialect/VeronaDialect.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
@@ -20,6 +19,14 @@ namespace
   bool hasTerminator(mlir::Block* bb)
   {
     return !bb->getOperations().empty() && bb->back().isKnownTerminator();
+  }
+
+  /// Check if value is from an alloca operation
+  /// TODO: This will probably disappear entirely once we have free var analisys
+  bool isAlloca(mlir::Value val)
+  {
+    // For now, allocas are opaque operations
+    return val.getDefiningOp()->getName().stripDialect() == "alloca";
   }
 
   /// Add a new basic block into a region and return it
@@ -51,61 +58,97 @@ namespace mlir::verona
       Identifier::get(path.file, context), path.line, path.column);
   }
 
-  void Generator::declareVariable(llvm::StringRef name, mlir::Value val)
-  {
-    assert(!symbolTable.inScope(name) && "Redeclaration");
-    symbolTable.insert(name, val);
-  }
-
-  void Generator::updateVariable(llvm::StringRef name, mlir::Value val)
-  {
-    assert(symbolTable.inScope(name) && "Variable not declared");
-    symbolTable.update(name, val);
-  }
-
-  void Generator::declareFunction(
-    llvm::StringRef name,
-    llvm::ArrayRef<llvm::StringRef> types,
-    llvm::StringRef retTy)
-  {
-    // If already declared, ignore
-    if (functionTable.inScope(name))
-      return;
-
-    // Map type names to MLIR types
-    Types argTys;
-    for (auto a : types)
-      argTys.push_back(genOpaqueType(a));
-    llvm::SmallVector<mlir::Type, 1> retTys;
-    if (!retTy.empty())
-      retTys.push_back(genOpaqueType(retTy));
-
-    // Generate the function and check: this should never fail
-    auto func = generateProto(unkLoc, name, argTys, retTys);
-    if (auto err = func.takeError())
-      assert(false && "FIXME: broken function generator");
-
-    // Add function declaration to the module
-    module->push_back(*func);
-  }
-
   // ===================================================== AST -> MLIR
   llvm::Error Generator::parseModule(const ::ast::Ast& ast)
   {
-    assert(AST::isClass(ast) && "Bad node");
-    module = mlir::ModuleOp::create(getLocation(ast));
-    // TODO: Support more than just functions at the module level
-    auto body = AST::getClassBody(ast);
-    llvm::SmallVector<::ast::WeakAst, 4> funcs;
-    AST::getSubNodes(funcs, body);
-    for (auto f : funcs)
-    {
-      auto fun = parseFunction(f.lock());
-      if (auto err = fun.takeError())
-        return err;
-      module->push_back(*fun);
-    }
+    // Modules are nothing but global classes
+    auto global = parseClass(ast);
+    if (auto err = global.takeError())
+      return std::move(err);
+    module = *global;
+
     return llvm::Error::success();
+  }
+
+  llvm::Expected<ModuleOp>
+  Generator::parseClass(const ::ast::Ast& ast, mlir::Type parent)
+  {
+    assert(AST::isClass(ast) && "Bad node");
+    auto loc = getLocation(ast);
+
+    // Push another scope for variables and functions
+    SymbolScopeT var_scope(symbolTable);
+    FunctionScopeT func_scope(functionTable);
+
+    // Declare before building fields to allow for recursive declaration
+    // If class is used in definitions before, it has been declared empty
+    // already, so we use `update` to fetch it.
+    auto name = AST::getID(ast);
+    auto type = ClassType::get(context, name);
+    typeTable.getOrAdd(name, type);
+
+    // Creates the scope, each class/module is a new sub-module.
+    auto scope = mlir::ModuleOp::create(getLocation(ast), name);
+
+    // Nested classes, field names and types, methods, etc.
+    llvm::SmallVector<::ast::Ast, 4> nodes;
+    AST::getSubNodes(nodes, AST::getClassBody(ast));
+    llvm::SmallVector<std::pair<StringRef, mlir::Type>, 4> fields;
+
+    // Set the parent class
+    if (parent)
+      fields.push_back({"$parent", parent});
+
+    // Scan all nodes for nested classes, fields and methods
+    for (auto node : nodes)
+    {
+      if (AST::isClass(node))
+      {
+        // Recurse into nested classes
+        auto classMod = parseClass(node, type);
+        if (auto err = classMod.takeError())
+          return std::move(err);
+        // Push sub-class to scope
+        scope.push_back(*classMod);
+      }
+      else if (AST::isField(node))
+      {
+        // Get field name/type for class type declaration
+        auto fieldName = AST::getID(node);
+        auto fieldType = parseType(AST::getType(node));
+        fields.push_back({fieldName, fieldType});
+      }
+      else if (AST::isFunction(node))
+      {
+        // Methods
+        auto func = parseFunction(node);
+        if (auto err = func.takeError())
+          return std::move(err);
+        // Associate function with module (late mangling)
+        func->setAttr("class", TypeAttr::get(type));
+        // Add qualifiers as attributes
+        llvm::SmallVector<::ast::Ast, 4> quals;
+        AST::getFunctionQualifiers(quals, node);
+        if (!quals.empty())
+        {
+          llvm::SmallVector<mlir::Attribute, 4> qualAttrs;
+          for (auto qual : quals)
+            qualAttrs.push_back(
+              StringAttr::get(AST::getTokenValue(qual), context));
+          func->setAttr("qualifiers", ArrayAttr::get(qualAttrs, context));
+        }
+        // Push function to scope
+        scope.push_back(*func);
+      }
+      else
+      {
+        return parsingError(
+          "Expecting field or function on class " + name.str(), loc);
+      }
+    }
+    type.setFields(fields);
+
+    return scope;
   }
 
   llvm::Expected<mlir::FuncOp> Generator::parseFunction(const ::ast::Ast& ast)
@@ -114,7 +157,7 @@ namespace mlir::verona
 
     // Parse 'where' clause
     TypeScopeT alias_scope(typeTable);
-    llvm::SmallVector<::ast::WeakAst, 4> constraints;
+    llvm::SmallVector<::ast::Ast, 4> constraints;
     AST::getFunctionConstraints(constraints, ast);
     for (auto c : constraints)
     {
@@ -123,24 +166,24 @@ namespace mlir::verona
       // state of the type system, this will "work" for now.
       auto alias = AST::getID(c);
       auto ty = AST::getType(c);
-      typeTable.insert(alias, parseType(ty.lock()));
+      typeTable.insert(alias, parseType(ty));
     }
 
     // Function type from signature
     llvm::SmallVector<llvm::StringRef, 4> argNames;
     Types types;
-    llvm::SmallVector<::ast::WeakAst, 4> args;
+    llvm::SmallVector<::ast::Ast, 4> args;
     AST::getFunctionArgs(args, ast);
     for (auto arg : args)
     {
       argNames.push_back(AST::getID(arg));
-      types.push_back(parseType(AST::getType(arg).lock()));
+      types.push_back(parseType(AST::getType(arg)));
     }
 
     // Return type is nothing if no type
     llvm::SmallVector<mlir::Type, 1> retTy;
     if (AST::hasType(AST::getFunctionType(ast)))
-      retTy.push_back(parseType(AST::getFunctionType(ast).lock()));
+      retTy.push_back(parseType(AST::getFunctionType(ast)));
 
     // If just declaration, return the proto value
     auto name = AST::getFunctionName(ast);
@@ -164,7 +207,7 @@ namespace mlir::verona
 
     // Lower body
     auto body = AST::getFunctionBody(ast);
-    auto last = parseNode(body.lock());
+    auto last = parseNode(body);
     if (auto err = last.takeError())
       return std::move(err);
 
@@ -199,59 +242,42 @@ namespace mlir::verona
 
   mlir::Type Generator::generateType(llvm::StringRef name)
   {
+    // If already created, return symbol
+    if (auto type = typeTable.lookup(name))
+      return type;
+
     // Capabilities / boolean
     if (name == "iso")
-      return CapabilityType::get(context, Capability::Isolated);
+      return typeTable.insert(name, getIso(context));
     else if (name == "mut")
-      return CapabilityType::get(context, Capability::Mutable);
+      return typeTable.insert(name, getMut(context));
     else if (name == "imm")
-      return CapabilityType::get(context, Capability::Immutable);
-    else if (name == "bool")
-      return BoolType::get(context);
+      return typeTable.insert(name, getImm(context));
 
-    // Numeric
-    size_t bitWidth = 0;
-    name.substr(1).getAsInteger(10, bitWidth);
-    bool validWidth = bitWidth >= 8 && bitWidth <= 128;
-
-    // Float
-    bool isFloat = name.startswith("F");
-    if (isFloat && validWidth)
-      return FloatType::get(context, bitWidth);
-
-    // Integer
-    bool isSigned = name.startswith("S");
-    bool isUnsigned = name.startswith("U");
-    if ((isSigned || isUnsigned) && validWidth)
-      return IntegerType::get(context, bitWidth, isSigned);
-
-    // Anything else, return opaque for now
-    // TODO: Implement all Verona types...
-    return genOpaqueType(name);
+    // Every other type is just a class that we don't know yet
+    return typeTable.insert(name, ClassType::get(context, name));
   }
 
   mlir::Type Generator::parseType(const ::ast::Ast& ast)
   {
-    // Match any existing Verona types
+    // Qualified types are references to classes
+    if (AST::isQualType(ast))
+      return generateType(AST::getID(ast));
+
+    assert(AST::isTypeHolder(ast) && "Bad node");
+
+    // Get type components
     char sep = 0;
-    llvm::SmallVector<::ast::WeakAst, 1> nodes;
+    llvm::SmallVector<::ast::Ast, 1> nodes;
     AST::getTypeElements(ast, sep, nodes);
 
     // No types, return "unknown"
     if (nodes.size() == 0)
       return unkTy;
 
-    // Simple types should work directly, including `where` types.
-    // FIXME: This treats `where` as alias, but they're really not.
+    // Simple types should work directly
     if (nodes.size() == 1)
-    {
-      auto name = AST::getID(nodes[0]);
-      if (auto type = typeTable.lookup(name))
-        return type;
-      auto type = generateType(name);
-      typeTable.insert(name, type);
-      return type;
-    }
+      return generateType(AST::getID(nodes[0]));
 
     // Composite types (meet, join) may require recursion
     llvm::SmallVector<mlir::Type, 1> types;
@@ -260,7 +286,7 @@ namespace mlir::verona
       // Recursive nodes
       if (AST::isTypeHolder(node))
       {
-        types.push_back(parseType(node.lock()));
+        types.push_back(parseType(node));
       }
       // Direct nodes
       else
@@ -269,7 +295,7 @@ namespace mlir::verona
       }
     }
 
-    // Return group of nodes
+    // Return set of nodes, no need to cache
     switch (sep)
     {
       case '|':
@@ -286,12 +312,15 @@ namespace mlir::verona
 
   llvm::Expected<ReturnValue> Generator::parseBlock(const ::ast::Ast& ast)
   {
+    // Blocks add lexical context
+    SymbolScopeT var_scope{symbolTable};
+
     ReturnValue last;
-    llvm::SmallVector<::ast::WeakAst, 4> nodes;
+    llvm::SmallVector<::ast::Ast, 4> nodes;
     AST::getSubNodes(nodes, ast);
     for (auto sub : nodes)
     {
-      auto node = parseNode(sub.lock());
+      auto node = parseNode(sub);
       if (auto err = node.takeError())
         return std::move(err);
       last = *node;
@@ -309,6 +338,8 @@ namespace mlir::verona
       case AST::NodeKind::Assign:
         return parseAssign(ast);
       case AST::NodeKind::Call:
+      case AST::NodeKind::Invoke:
+      case AST::NodeKind::StaticCall:
         return parseCall(ast);
       case AST::NodeKind::Return:
         return parseReturn(ast);
@@ -322,6 +353,10 @@ namespace mlir::verona
         return parseContinue(ast);
       case AST::NodeKind::Break:
         return parseBreak(ast);
+      case AST::NodeKind::New:
+        return parseNew(ast);
+      case AST::NodeKind::Member:
+        return parseFieldRead(ast);
     }
 
     if (AST::isValue(ast))
@@ -340,7 +375,7 @@ namespace mlir::verona
       auto name = AST::getTokenValue(ast);
       auto var = symbolTable.lookup(name);
       assert(var && "Undeclared variable lookup, broken ast");
-      if (var.getType() == allocaTy)
+      if (isAlloca(var))
         return generateLoad(getLocation(ast), var);
       return var;
     }
@@ -355,7 +390,7 @@ namespace mlir::verona
     // TODO: Literals need attributes and types
     assert(AST::isValue(ast) && "Bad node");
     return parsingError(
-      "Value [" + AST::getName(ast) + " = " + AST::getTokenValue(ast) +
+      "Value [" + AST::getName(ast) + " = " + AST::getTokenValue(ast).str() +
         "] not implemented yet",
       getLocation(ast));
   }
@@ -364,28 +399,39 @@ namespace mlir::verona
   {
     assert(AST::isAssign(ast) && "Bad node");
 
-    // Can either be a let (new variable) or localref (existing variable).
-    auto var = AST::getLHS(ast);
-    auto name = AST::getLocalName(var);
+    // The right-hand side can be any expression
+    // This is the value and we update the variable
+    // We parse it first to lower field-write correctly
+    auto rhs = parseNode(AST::getRHS(ast));
+    if (auto err = rhs.takeError())
+      return std::move(err);
+
+    auto lhs = AST::getLHS(ast);
+    // If the LHS is a field member, we have a Verona operation to represent
+    // writing to a field without an explicit alloca/store.
+    if (AST::isMember(lhs))
+      return parseFieldWrite(lhs, rhs->get());
+
+    // Else, it can either be a let (new variable)
+    // or localref (existing variable).
+    auto name = AST::getLocalName(lhs);
 
     // If the variable wasn't declared yet in this context, create an alloca
-    // TODO: Implement declaration of tuples (multiple values)
-    if (AST::isLet(var))
+    if (AST::isLet(lhs))
     {
-      auto alloca = generateAlloca(getLocation(ast));
-      declareVariable(name, alloca);
+      auto type = unkTy;
+      // If type was declared, use it
+      auto declType = AST::getType(lhs);
+      if (AST::hasType(declType))
+        type = parseType(declType);
+      auto alloca = generateAlloca(getLocation(ast), type);
+      symbolTable.insert(name, alloca);
     }
     auto store = symbolTable.lookup(name);
     if (!store)
       return parsingError(
-        "Variable " + name + " not declared before use",
-        getLocation(var.lock()));
-
-    // The right-hand side can be any expression
-    // This is the value and we update the variable
-    auto rhs = parseNode(AST::getRHS(ast).lock());
-    if (auto err = rhs.takeError())
-      return std::move(err);
+        "Variable " + name.str() + " not declared before use",
+        getLocation(lhs));
 
     // Store the value in the alloca
     return generateStore(getLocation(ast), rhs->get(), store);
@@ -393,87 +439,68 @@ namespace mlir::verona
 
   llvm::Expected<ReturnValue> Generator::parseCall(const ::ast::Ast& ast)
   {
-    assert(AST::isCall(ast) && "Bad node");
+    // All operations are calls, including arithmetic, comparison, casts
+    // but they can be: `invoke`, `call` or `static-call`.
+    assert(
+      (AST::isCall(ast) || AST::isInvoke(ast) || AST::isStaticCall(ast)) &&
+      "Bad node");
     auto name = AST::getID(ast);
+    auto loc = getLocation(ast);
 
-    // All operations are calls, only calls to previously defined functions
-    // are function calls.
-    if (auto func = functionTable.lookup(name))
+    // Get arguments
+    llvm::SmallVector<::ast::Ast, 1> nodes;
+    AST::getAllOperands(nodes, ast);
+    llvm::SmallVector<mlir::Value, 1> args;
+    for (auto node : nodes)
     {
-      llvm::SmallVector<::ast::WeakAst, 4> argNodes;
-      AST::getAllOperands(argNodes, ast);
-      auto argTypes = func.getType().getInputs();
-      assert(argNodes.size() == argTypes.size() && "Wrong number of arguments");
-      llvm::SmallVector<mlir::Value, 4> args;
-
-      // For each argument / type, cast.
-      for (const auto& val_ty : llvm::zip(argNodes, argTypes))
-      {
-        // Arguments lowered before the call
-        auto arg = std::get<0>(val_ty).lock();
-        auto val = parseNode(arg);
-        if (auto err = val.takeError())
-          return std::move(err);
-
-        // Types could be incomplete here, casts may be needed
-        auto argTy = std::get<1>(val_ty);
-        auto cast = generateAutoCast(getLocation(arg), val->get(), argTy);
-        args.push_back(cast);
-      }
-
-      auto call = builder.create<mlir::CallOp>(getLocation(ast), func, args);
-      auto res = call.getResults();
-      return res;
-    }
-
-    // Else, it should be an operation that we can lower natively
-    if (AST::isUnary(ast))
-    {
-      return parsingError(
-        "Unary Operation '" + name + "' not implemented yet", getLocation(ast));
-    }
-    else if (AST::isBinary(ast))
-    {
-      // Get both arguments
-      // TODO: If the arguments are tuples, do we need to apply element-wise?
-      auto arg0 = parseNode(AST::getOperand(ast, 0).lock());
-      if (auto err = arg0.takeError())
+      auto arg = parseNode(node);
+      if (auto err = arg.takeError())
         return std::move(err);
-      auto arg1 = parseNode(AST::getOperand(ast, 1).lock());
-      if (auto err = arg1.takeError())
-        return std::move(err);
-
-      // Get op name and type
-      using opPairTy = std::pair<llvm::StringRef, mlir::Type>;
-      opPairTy opTy = llvm::StringSwitch<opPairTy>(name)
-                        .Case("+", {"verona.add", unkTy})
-                        .Case("-", {"verona.sub", unkTy})
-                        .Case("*", {"verona.mul", unkTy})
-                        .Case("/", {"verona.div", unkTy})
-                        .Case("==", {"verona.eq", boolTy})
-                        .Case("!=", {"verona.ne", boolTy})
-                        .Case(">", {"verona.gt", boolTy})
-                        .Case("<", {"verona.lt", boolTy})
-                        .Case(">=", {"verona.ge", boolTy})
-                        .Case("<=", {"verona.le", boolTy})
-                        .Default(std::make_pair("", unkTy));
-      auto opName = opTy.first;
-      auto opType = opTy.second;
-
-      // Match, return the right op with the right type
-      if (!opName.empty())
-      {
-        return genOperation(
-          getLocation(ast), opName, {arg0->get(), arg1->get()}, opType);
-      }
-
-      return parsingError(
-        "Binary operation '" + name + "' not implemented yet",
-        getLocation(ast));
+      args.push_back(arg->get());
     }
 
-    return parsingError(
-      "Operation '" + name + "' not implemented yet", getLocation(ast));
+    // Some calls are lowered as special nodes, do those first
+    if (name == "tidy")
+    {
+      assert(args.size() == 1 && "Wrong number of arguments for tidy");
+      builder.create<TidyOp>(getLocation(ast), args[0]);
+      return ReturnValue();
+    }
+    else if (name == "drop")
+    {
+      assert(args.size() == 1 && "Wrong number of arguments for drop");
+      builder.create<DropOp>(getLocation(ast), args[0]);
+      return ReturnValue();
+    }
+
+    // Some function calls are static (to global functions or static members),
+    // others are dynamic (with an instance of a class as the first or left
+    // argument.
+    // Both need a descriptor, to know where to find the function to call.
+    mlir::Value descriptor;
+    if (AST::isCall(ast) || AST::isInvoke(ast))
+    {
+      // Dynamic call: `a op b` | `a.op(b...)`
+      assert(args.size() >= 1 && "Too few arguments for dynamic call");
+      descriptor = args[0];
+      args.erase(args.begin());
+    }
+    else
+    {
+      // Static call: `func(a, b...)` | `Class.op(a, b...)`
+      auto qualType = AST::getStaticQualType(ast);
+      auto type = parseType(qualType);
+      auto descTy = DescriptorType::get(context, type);
+      descriptor = builder.create<StaticOp>(loc, descTy, TypeAttr::get(type));
+    }
+
+    // Right now, we may not have enough type information to know which is which
+    // and how many arguments there are or which types are involved. When in
+    // doubt, use `unknown`.
+    ValueRange argVals{args};
+    auto call = builder.create<CallOp>(
+      loc, unkTy, descriptor, StringAttr::get(name, context), argVals);
+    return call.res();
   }
 
   llvm::Expected<ReturnValue> Generator::parseReturn(const ::ast::Ast& ast)
@@ -484,7 +511,7 @@ namespace mlir::verona
     ReturnValue expr;
     if (AST::hasSubs(ast))
     {
-      auto node = parseNode(AST::getSingleSubNode(ast).lock());
+      auto node = parseNode(AST::getSingleSubNode(ast));
       if (auto err = node.takeError())
         return std::move(err);
       expr = *node;
@@ -538,7 +565,7 @@ namespace mlir::verona
 
     // First node is a sequence of conditions
     // lower in the current basic block.
-    auto condNode = AST::getCond(ast).lock();
+    auto condNode = AST::getCond(ast);
     auto condLoc = getLocation(condNode);
     auto cond = parseNode(condNode);
     if (auto err = cond.takeError())
@@ -572,7 +599,7 @@ namespace mlir::verona
       SymbolScopeT if_scope{symbolTable};
 
       // If block
-      auto ifNode = AST::getIfBlock(ast).lock();
+      auto ifNode = AST::getIfBlock(ast);
       auto ifLoc = getLocation(ifNode);
       builder.setInsertionPointToEnd(ifBB);
       auto ifBlock = parseNode(ifNode);
@@ -589,7 +616,7 @@ namespace mlir::verona
       // Create local context for the else block variables
       SymbolScopeT else_scope{symbolTable};
 
-      auto elseNode = AST::getElseBlock(ast).lock();
+      auto elseNode = AST::getElseBlock(ast);
       auto elseLoc = getLocation(elseNode);
       builder.setInsertionPointToEnd(elseBB);
       auto elseBlock = parseNode(elseNode);
@@ -624,7 +651,7 @@ namespace mlir::verona
 
     // First node is a sequence of conditions
     // lower in the head basic block, with the conditional branch.
-    auto condNode = AST::getCond(ast).lock();
+    auto condNode = AST::getCond(ast);
     auto condLoc = getLocation(condNode);
     builder.setInsertionPointToEnd(headBB);
     auto cond = parseNode(condNode);
@@ -641,7 +668,7 @@ namespace mlir::verona
     loopTable.insert("tail", exitBB);
 
     // Loop body, branch back to head node which will decide exit criteria
-    auto bodyNode = AST::getLoopBlock(ast).lock();
+    auto bodyNode = AST::getLoopBlock(ast);
     auto bodyLoc = getLocation(bodyNode);
     builder.setInsertionPointToEnd(bodyBB);
     auto bodyBlock = parseNode(bodyNode);
@@ -669,70 +696,65 @@ namespace mlir::verona
 
     // First, we identify the iterator. Nested loops will have their own
     // iterators, of the same name, but within their own lexical blocks.
-    auto seqNode = AST::getLoopSeq(ast).lock();
+    auto seqNode = AST::getLoopSeq(ast);
     auto list = parseNode(seqNode);
     if (auto err = list.takeError())
       return std::move(err);
-    declareVariable(ABI::LoopIterator::handler, list->get());
-    llvm::SmallVector<mlir::Value, 1> iter{
-      symbolTable.lookup(ABI::LoopIterator::handler)};
+    auto handler = symbolTable.insert("$iter", list->get());
+    llvm::SmallVector<mlir::Value, 1> iter{handler};
+    auto iterTy = list->get().getType();
 
     // Create the head basic-block, which will check the condition
     // and dispatch the loop to the body block or exit.
     auto region = builder.getInsertionBlock()->getParent();
     mlir::ValueRange empty{};
+    auto nextBB = addBlock(region);
     auto headBB = addBlock(region);
     auto bodyBB = addBlock(region);
     auto exitBB = addBlock(region);
     builder.create<mlir::BranchOp>(getLocation(ast), headBB, empty);
 
     // First node is a check if the list has value, returns boolean.
-    declareFunction(
-      ABI::LoopIterator::check::name,
-      {ABI::LoopIterator::check::types[0]},
-      ABI::LoopIterator::check::retTy);
-    auto has_value = functionTable.lookup(ABI::LoopIterator::check::name);
-    auto condLoc = getLocation(seqNode);
     builder.setInsertionPointToEnd(headBB);
-    auto cond = builder.create<mlir::CallOp>(condLoc, has_value, iter);
+    auto condLoc = getLocation(seqNode);
+    auto hasValueCall = builder.create<CallOp>(
+      condLoc, unkTy, handler, StringAttr::get("has_value", context), empty);
+    auto hasValue = hasValueCall.getResult();
     if (
-      auto err = generateCondBranch(
-        condLoc, cond.getResult(0), bodyBB, empty, exitBB, empty))
+      auto err =
+        generateCondBranch(condLoc, hasValue, bodyBB, empty, exitBB, empty))
       return std::move(err);
 
     // Create local head/tail basic-block context for continue/break
     BasicBlockScopeT loop_scope{loopTable};
-    loopTable.insert("head", headBB);
+    loopTable.insert("head", nextBB);
     loopTable.insert("tail", exitBB);
 
     // Preamble for the loop body is:
     //  val = $iter.apply();
     // val must have been declared in outer scope
-    declareFunction(
-      ABI::LoopIterator::apply::name,
-      {ABI::LoopIterator::apply::types[0]},
-      ABI::LoopIterator::apply::retTy);
-    auto apply = functionTable.lookup(ABI::LoopIterator::apply::name);
     builder.setInsertionPointToEnd(bodyBB);
+    auto applyCall = builder.create<CallOp>(
+      condLoc, unkTy, handler, StringAttr::get("apply", context), empty);
+    auto apply = applyCall.getResult();
     auto indVarName = AST::getTokenValue(AST::getLoopInd(ast));
-    auto value = builder.create<mlir::CallOp>(condLoc, apply, iter);
-    declareVariable(indVarName, value.getResult(0));
-    //  %iter.next();
-    declareFunction(
-      ABI::LoopIterator::next::name,
-      {ABI::LoopIterator::next::types[0]},
-      ABI::LoopIterator::next::retTy);
-    auto next = functionTable.lookup(ABI::LoopIterator::next::name);
-    builder.create<mlir::CallOp>(condLoc, next, iter);
+    symbolTable.insert(indVarName, apply);
 
     // Loop body, branch back to head node which will decide exit criteria
-    auto bodyNode = AST::getLoopBlock(ast).lock();
+    auto bodyNode = AST::getLoopBlock(ast);
     auto bodyLoc = getLocation(bodyNode);
     auto bodyBlock = parseNode(bodyNode);
     if (auto err = bodyBlock.takeError())
       return std::move(err);
     if (!hasTerminator(builder.getBlock()))
-      builder.create<mlir::BranchOp>(bodyLoc, headBB, empty);
+      builder.create<mlir::BranchOp>(bodyLoc, nextBB, empty);
+
+    //  %iter.next();
+    builder.setInsertionPointToEnd(nextBB);
+    auto nextCall = builder.create<CallOp>(
+      condLoc, iterTy, handler, StringAttr::get("next", context), empty);
+    auto next = nextCall.getResult();
+    builder.create<mlir::BranchOp>(bodyLoc, headBB, empty);
 
     // Move to exit block, where the remaining instructions will be lowered.
     builder.setInsertionPointToEnd(exitBB);
@@ -763,6 +785,108 @@ namespace mlir::verona
     return ReturnValue();
   }
 
+  llvm::Expected<ReturnValue> Generator::parseNew(const ::ast::Ast& ast)
+  {
+    assert(AST::isNew(ast) && "Bad node");
+    auto loc = getLocation(ast);
+
+    // Class name
+    auto name = AST::getID(AST::getClassTypeRef(ast));
+    auto nameAttr = SymbolRefAttr::get(name, context);
+
+    // Type to allocate
+    auto type = parseType(ast);
+    auto typeAttr = TypeAttr::get(type);
+
+    // Initializer list
+    llvm::SmallVector<::ast::Ast, 4> nodes;
+    AST::getSubNodes(nodes, AST::getClassBody(ast));
+    llvm::SmallVector<mlir::Attribute, 1> fieldNames;
+    llvm::SmallVector<mlir::Value, 1> fieldValues;
+    for (auto node : nodes)
+    {
+      if (!AST::isField(node))
+        continue;
+      fieldNames.push_back(StringAttr::get(AST::getID(node), context));
+      auto expr = parseNode(AST::getInitExpr(node));
+      if (auto err = expr.takeError())
+        return std::move(err);
+      fieldValues.push_back(expr->get());
+    }
+    auto fieldNameAttr = ArrayAttr::get(fieldNames, context);
+    ValueRange inits{fieldValues};
+
+    if (AST::hasInRegion(ast))
+    {
+      // If there's an `inreg`, allocate object on existing region
+      auto regionName = AST::getID(AST::getInRegion(ast));
+      auto regionObj = symbolTable.lookup(regionName);
+      if (isAlloca(regionObj))
+        regionObj = generateLoad(loc, regionObj);
+      auto alloc = builder.create<AllocateObjectOp>(
+        loc, type, nameAttr, fieldNameAttr, inits, regionObj);
+      return alloc.getResult();
+    }
+    else
+    {
+      // If not, allocate a new region
+      auto alloc = builder.create<AllocateRegionOp>(
+        loc, type, nameAttr, fieldNameAttr, inits);
+      return alloc.getResult();
+    }
+  }
+
+  llvm::Expected<ReturnValue> Generator::parseFieldRead(const ::ast::Ast& ast)
+  {
+    assert(AST::isMember(ast) && "Bad node");
+
+    // Find the variable to extract from
+    auto ref = AST::getLocalRef(ast);
+    auto var = symbolTable.lookup(ref);
+
+    // Get the field name
+    auto field = AST::getID(ast);
+    auto fieldAttr = StringAttr::get(field, context);
+
+    // Find the field type, if any
+    auto fieldType = unkTy;
+    if (auto classType = var.getType().dyn_cast<ClassType>())
+      fieldType = classType.getFieldType(field);
+
+    // Return the output of the field read op
+    auto loc = getLocation(ast);
+    auto op = builder.create<FieldReadOp>(loc, fieldType, var, field);
+    return op.getResult();
+  }
+
+  llvm::Expected<ReturnValue>
+  Generator::parseFieldWrite(const ::ast::Ast& ast, mlir::Value value)
+  {
+    assert(AST::isMember(ast) && "Bad node");
+
+    // Find the variable to extract from
+    auto ref = AST::getLocalRef(ast);
+    auto var = symbolTable.lookup(ref);
+
+    // Get the field name
+    auto field = AST::getID(ast);
+    auto fieldAttr = StringAttr::get(field, context);
+
+    // Find the field type
+    auto fieldType = unkTy;
+    if (auto classType = var.getType().dyn_cast<ClassType>())
+      fieldType = classType.getFieldType(field);
+
+    // Make sure we have the same type
+    auto loc = getLocation(ast);
+    if (value.getType() != fieldType)
+      value = generateAutoCast(loc, value, fieldType);
+
+    // Return the output of the field read op
+    auto op = builder.create<FieldWriteOp>(loc, fieldType, var, value, field);
+    return op.getResult();
+  }
+
   // ===================================================== MLIR Generators
   llvm::Expected<mlir::FuncOp> Generator::generateProto(
     mlir::Location loc,
@@ -770,13 +894,10 @@ namespace mlir::verona
     llvm::ArrayRef<mlir::Type> types,
     llvm::ArrayRef<mlir::Type> retTy)
   {
-    assert(!functionTable.inScope(name) && "Duplicated function declaration");
-
     // Create function
     auto funcTy = builder.getFunctionType(types, retTy);
     auto func = mlir::FuncOp::create(loc, name, funcTy);
-    functionTable.insert(name, func);
-    return func;
+    return functionTable.insert(name, func);
   }
 
   llvm::Expected<mlir::FuncOp> Generator::generateEmptyFunction(
@@ -790,14 +911,14 @@ namespace mlir::verona
 
     // If it's not declared yet, do so. This simplifies direct declaration of
     // compiler functions. User functions should be checked at the parse level.
-    if (!functionTable.inScope(name))
+    auto func = functionTable.inScope(name);
+    if (!func)
     {
       auto proto = generateProto(loc, name, types, retTy);
       if (auto err = proto.takeError())
         return std::move(err);
-      functionTable.insert(name, *proto);
+      func = *proto;
     }
-    auto func = functionTable.lookup(name);
 
     // Create entry block, set builder entry point
     auto& entryBlock = *func.addEntryBlock();
@@ -812,10 +933,10 @@ namespace mlir::verona
       auto name = std::get<0>(var_val);
       auto value = std::get<1>(var_val);
       // Allocate space in the stack & store the argument value
-      auto alloca = generateAlloca(loc);
+      auto alloca = generateAlloca(loc, value.getType());
       auto store = generateStore(loc, value, alloca);
       // Associate the name with the alloca SSA value
-      declareVariable(name, alloca);
+      symbolTable.insert(name, alloca);
     }
 
     return func;
@@ -871,31 +992,25 @@ namespace mlir::verona
     // this to emit the attribute right away.
     mlir::Type type = unkTy;
     if (!typeName.empty())
-      type = genOpaqueType(typeName);
+      type = generateType(typeName);
     return genOperation(loc, "verona.constant(" + value.str() + ")", {}, type);
   }
 
-  mlir::Value
-  Generator::generateAlloca(mlir::Location loc, llvm::StringRef typeName)
+  mlir::Value Generator::generateAlloca(mlir::Location loc, mlir::Type type)
   {
-    mlir::Type type = allocaTy;
-    if (!typeName.empty())
-      type = genOpaqueType(typeName);
     return genOperation(loc, "verona.alloca", {}, type);
   }
 
   mlir::Value Generator::generateLoad(mlir::Location loc, mlir::Value addr)
   {
-    // TODO: Check if addr's type is a known pointer type and dereference
-    // the type to use here instead of unkTy.
+    // We let the future type inference pass determine the type of loads/stores
     return genOperation(loc, "verona.load", {addr}, unkTy);
   }
 
   mlir::Value Generator::generateStore(
     mlir::Location loc, mlir::Value value, mlir::Value addr)
   {
-    // TODO: Check if addr's type is a known pointer type and dereference
-    // the type to use here instead of unkTy.
+    // We let the future type inference pass determine the type of loads/stores
     return genOperation(loc, "verona.store", {value, addr}, unkTy);
   }
 
@@ -913,11 +1028,5 @@ namespace mlir::verona
     auto op = builder.createOperation(state);
     auto res = op->getResult(0);
     return res;
-  }
-
-  mlir::OpaqueType Generator::genOpaqueType(llvm::StringRef name)
-  {
-    auto dialect = mlir::Identifier::get("type", context);
-    return mlir::OpaqueType::get(dialect, name, context);
   }
 }

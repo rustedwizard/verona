@@ -11,6 +11,12 @@ namespace verona::interpreter
 {
   using bytecode::Register;
 
+  template<bool Const>
+  class BaseValueList;
+
+  using ValueList = BaseValueList<false>;
+  using ConstValueList = BaseValueList<true>;
+
   class VM
   {
   public:
@@ -56,6 +62,7 @@ namespace verona::interpreter
     opcode_binop(bytecode::BinaryOperator op, uint64_t left, uint64_t right);
     void opcode_call(SelectorIdx selector, uint8_t callspace);
     Value opcode_clear();
+    void opcode_clear_list(ValueList values);
     Value opcode_copy(Value src);
     void opcode_fulfill_sleeping_cown(const Value& cown, Value result);
     Value opcode_freeze(Value src);
@@ -72,7 +79,9 @@ namespace verona::interpreter
     Value opcode_new_region(const VMDescriptor* descriptor);
     Value opcode_new_cown(const VMDescriptor* descriptor, Value src);
     Value opcode_new_sleeping_cown(const VMDescriptor* descriptor);
-    void opcode_print(std::string_view fmt, uint8_t argc);
+    void opcode_print(std::string_view fmt, ConstValueList values);
+    void opcode_protect(ConstValueList values);
+    void opcode_unprotect(ConstValueList values);
     void opcode_return();
     Value opcode_store(const Value& base, SelectorIdx selector, Value src);
     Value opcode_string(std::string_view imm);
@@ -187,8 +196,13 @@ namespace verona::interpreter
      *
      * Each execution frame has a view into this stack. Register access is done
      * within this view.
+     *
+     * Because of finalisers, the VM needs to support re-entrant invocations,
+     * which may cause the stack to grow at unexpected times. We use a deque
+     * rather than a vector to make sure references don't get invalidated when
+     * this happens.
      */
-    std::vector<Value> stack_;
+    std::deque<Value> stack_;
 
     struct Frame
     {
@@ -252,6 +266,9 @@ namespace verona::interpreter
     friend struct convert_operand;
     template<typename T>
     friend struct execute_handler;
+
+    template<bool IsConst>
+    friend class BaseValueList;
   };
 
   /**

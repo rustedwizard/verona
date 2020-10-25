@@ -4,6 +4,7 @@
 
 namespace ast
 {
+  // Include PEG's ""_ operator for string-switches
   using namespace peg::udl;
 
   Ast token(const Ast& ast, const char* name, const std::string& token)
@@ -199,4 +200,9 @@ namespace ast
     thread_local size_t index;
     return index;
   }
+}
+
+void ast_dump(const ::ast::Ast& ast)
+{
+  std::cout << peg::ast_to_s(ast);
 }

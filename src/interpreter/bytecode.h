@@ -7,6 +7,7 @@
 #include <limits>
 #include <ostream>
 #include <string_view>
+#include <vector>
 
 /**
  * # Program Layout
@@ -144,6 +145,52 @@ namespace verona::bytecode
     explicit Register(uint8_t index) : index(index) {}
     uint8_t index;
   };
+
+  /**
+   * Contiguous sequence of Register values. It is used to encode and decode
+   * opcodes that accept a variable number of operands.
+   *
+   * This is a restricted subset of a C++20 `std::span<const Register>`
+   */
+  class RegisterSpan
+  {
+  public:
+    explicit RegisterSpan(const Register* begin, const Register* end)
+    : begin_(begin), end_(end)
+    {}
+
+    explicit RegisterSpan(const Register* begin, size_t size)
+    : RegisterSpan(begin, begin + size)
+    {}
+
+    RegisterSpan(const std::vector<Register>& regs)
+    : RegisterSpan(regs.data(), regs.size())
+    {}
+
+    RegisterSpan(const std::initializer_list<Register>& regs)
+    : RegisterSpan(regs.begin(), regs.end())
+    {}
+
+    size_t size() const
+    {
+      return end_ - begin_;
+    }
+
+    const Register* begin() const
+    {
+      return begin_;
+    }
+
+    const Register* end() const
+    {
+      return end_;
+    }
+
+  private:
+    const Register* begin_;
+    const Register* end_;
+  };
+
   constexpr static size_t REGISTER_COUNT = 256;
 
   enum class Opcode : uint8_t
@@ -151,6 +198,7 @@ namespace verona::bytecode
     BinOp, // op(u8), src1(u8), src2(u8)
     Call, // selector(u32), callspace(u8)
     Clear, // dst(u8)
+    ClearList, // argc(u8), dst(u8)...
     Copy, // dst(u8), src(u8)
     FulfillSleepingCown, // cown(u8), val(u8)
     Freeze, // dst(u8), src(u8)
@@ -169,9 +217,11 @@ namespace verona::bytecode
     NewRegion, // dst(u8), descriptor(u8)
     NewSleepingCown, // dst(u8), descriptor(u8)
     Print, // format(u8), argc(u8), args(u8)...
+    Protect, // argc(u8), args(u8)...
     Return,
     Store, // dst(u8), base(u8), selector(u32), src(u8)
     TraceRegion, // region(u8)
+    Unprotect, // argc(u8), args(u8)...
     Unreachable,
     When, // codepointer(u32), cown count(u8), capture count(u8)
 
@@ -231,6 +281,13 @@ namespace verona::bytecode
   {
     using Operands = OpcodeOperands<Register>;
     constexpr static std::string_view format = "CLEAR {}";
+  };
+
+  template<>
+  struct OpcodeSpec<Opcode::ClearList>
+  {
+    using Operands = OpcodeOperands<RegisterSpan>;
+    constexpr static std::string_view format = "CLEAR_LIST {}";
   };
 
   template<>
@@ -341,8 +398,15 @@ namespace verona::bytecode
   template<>
   struct OpcodeSpec<Opcode::Print>
   {
-    using Operands = OpcodeOperands<Register, uint8_t>;
+    using Operands = OpcodeOperands<Register, RegisterSpan>;
     constexpr static std::string_view format = "PRINT {}, {}";
+  };
+
+  template<>
+  struct OpcodeSpec<Opcode::Protect>
+  {
+    using Operands = OpcodeOperands<RegisterSpan>;
+    constexpr static std::string_view format = "PROTECT {}";
   };
 
   template<>
@@ -378,6 +442,13 @@ namespace verona::bytecode
   {
     using Operands = OpcodeOperands<CodePtr, uint8_t, uint8_t>;
     constexpr static std::string_view format = "WHEN {}, {:#x}, {:#x}";
+  };
+
+  template<>
+  struct OpcodeSpec<Opcode::Unprotect>
+  {
+    using Operands = OpcodeOperands<RegisterSpan>;
+    constexpr static std::string_view format = "UNPROTECT {}";
   };
 
   template<>
