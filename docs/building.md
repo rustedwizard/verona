@@ -1,3 +1,7 @@
+---
+layout: default
+title: Building project Verona
+---
 # Cloning
 
 To clone this repo, you need to pull in the submodules:
@@ -174,12 +178,12 @@ interpreter[.exe]
 ```
 On Windows, the simplest way to run an example is
 ```
-build\dist\veronac.exe --run testsuite\demo\run-pass\dining_phil.verona
+build\dist\veronac.exe --run testsuite\veronac\demo\run-pass\dining_phil.verona
 ```
 
 On Linux, the simplest way to run an example is
 ```
-build_ninja/dist/veronac --run testsuite/demo/run-pass/dining_phil.verona
+build_ninja/dist/veronac --run testsuite/veronac/demo/run-pass/dining_phil.verona
 ```
 
 This compiles the program to byte code and runs it through our interpreter. 
@@ -197,7 +201,7 @@ ninja check
 
 On Windows, this can be achieved with:
 ```
-cmake --build . --target check --config <config>
+ctest -C <config>
 ```
 Where `<config>` is the build type, e.g. Debug.
 
@@ -205,4 +209,3 @@ Where `<config>` is the build type, e.g. Debug.
 
 By default, the runtime tests are not built. To enable their building
 call cmake with `-DRT_TESTS=ON`.
-This will build the tests under `build[_ninja]/verona-prefix/src/verona-build/src/rt`.

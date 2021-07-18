@@ -179,7 +179,7 @@ namespace verona::rt
           auto dn = (DecNode*)dec_list.dequeue();
           auto o = dn->o;
           alloc->dealloc<sizeof(DecNode)>(dn);
-          Systematic::cout() << "Delayed decref on " << o << std::endl;
+          Systematic::cout() << "Delayed decref on " << o << Systematic::endl;
           Immutable::release(alloc, o);
         }
 
@@ -283,7 +283,7 @@ namespace verona::rt
       {
         if (!not_in_epoch(o, e))
         {
-          Systematic::cout() << "Ejecting other thread" << std::endl;
+          Systematic::cout() << "Ejecting other thread" << Systematic::endl;
           o->eject();
         }
 
@@ -420,10 +420,15 @@ namespace verona::rt
 
     ~Epoch()
     {
+      if (local_epoch == nullptr)
+        return;
+
       yield();
       local_epoch->release_epoch(alloc);
       yield();
     }
+
+    Epoch(const Epoch&) : alloc(nullptr), local_epoch(nullptr) {}
 
     void add_pressure()
     {

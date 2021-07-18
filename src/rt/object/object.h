@@ -338,7 +338,14 @@ namespace verona::rt
       if constexpr (scramble)
         return Systematic::get_scrambler().perm(sys_id);
       else
+#  ifdef USE_FLIGHT_RECORDER
+        // If the flight recorder is enabled to debug systematic
+        // testing, then we cannot assume the object still exists
+        // at log time, and thus this needs to be the raw pointer.
+        return (uintptr_t)this;
+#  else
         return sys_id;
+#  endif
 #else
       return (uintptr_t)this;
 #endif
@@ -597,18 +604,6 @@ namespace verona::rt
       get_header().bits &= ~(size_t)RegionMD::MARKED;
     }
 
-    inline void mark_pending()
-    {
-      assert(get_class() == RegionMD::UNMARKED);
-      get_header().bits |= (uint8_t)RegionMD::PENDING;
-    }
-
-    inline void unmark_pending()
-    {
-      assert(get_class() == RegionMD::PENDING);
-      get_header().bits &= ~(size_t)RegionMD::PENDING;
-    }
-
   public:
     inline EpochMark get_epoch_mark()
     {
@@ -629,7 +624,7 @@ namespace verona::rt
     {
       Systematic::cout() << "Object epoch: " << this << " (" << get_class()
                          << ") " << get_epoch_mark() << " -> " << e
-                         << std::endl;
+                         << Systematic::endl;
 
       // We only require relaxed consistency here as we can perfectly see old
       // values as we know that we will only need up-to-date values once we have

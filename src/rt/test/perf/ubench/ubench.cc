@@ -89,24 +89,24 @@ namespace ubench
 
       pinger->count++;
 
-      size_t cowns = 1;
-      recipients[1] = pinger;
-      recipients[0] =
-        pinger->pingers[pinger->rng.next() % pinger->pingers.size()];
-
-      if ((pinger->pingers.size() > 1) && (pinger->select_mod != 0))
+      recipients[0] = pinger;
+      const bool send_multimessage = (pinger->pingers.size() > 1) &&
+        (pinger->select_mod != 0) &&
+        ((pinger->rng.next() % pinger->select_mod) == 0);
+      if (!send_multimessage)
       {
-        while (recipients[0] == pinger)
-        {
-          recipients[0] =
-            pinger->pingers[pinger->rng.next() % pinger->pingers.size()];
-        }
-        if ((pinger->rng.next() % pinger->select_mod) == 0)
-          cowns = 2;
+        rt::Cown::schedule<Ping>(recipients[0], recipients[0]);
+        return;
       }
 
-      rt::Cown::schedule<Ping>(
-        cowns, (rt::Cown**)recipients.data(), recipients[0]);
+      // select another recipient
+      do
+      {
+        recipients[1] =
+          pinger->pingers[pinger->rng.next() % pinger->pingers.size()];
+      } while (recipients[1] == pinger);
+
+      rt::Cown::schedule<Ping>(2, (rt::Cown**)recipients.data(), recipients[0]);
     }
   };
 
@@ -118,11 +118,9 @@ namespace ubench
   static void start_timer(Monitor* monitor, std::chrono::milliseconds timeout)
   {
     rt::Cown::acquire(monitor);
-    rt::Scheduler::add_external_event_source();
     std::thread([=]() mutable {
       std::this_thread::sleep_for(timeout);
       rt::Cown::schedule<Stop, rt::YesTransfer>((rt::Cown*)monitor, monitor);
-      rt::Scheduler::remove_external_event_source();
     }).detach();
   }
 
@@ -134,6 +132,7 @@ namespace ubench
 
     void f()
     {
+      rt::Scheduler::add_external_event_source();
       for (auto* p : monitor->pingers)
       {
         p->count = 0;
@@ -190,6 +189,9 @@ namespace ubench
 
       rt::Cown::schedule<Report>(all_cowns_count, all_cowns, monitor);
 
+      // Drop count, Start will reincrease if more external work is needed.
+      rt::Scheduler::remove_external_event_source();
+
       if (--monitor->report_count != 0)
         rt::Cown::schedule<Start>(all_cowns_count, all_cowns, monitor);
       else
@@ -236,8 +238,9 @@ int main(int argc, char** argv)
   const auto percent_multimessage = opt.is<size_t>("--percent_multimessage", 5);
   check(percent_multimessage <= 100);
 
-  logger::cout() << "cores: " << cores << ", pingers: " << pingers
+  logger::cout() << "cores: " << cores
                  << ", report_interval: " << report_interval.count()
+                 << ", pingers: " << pingers
                  << ", initial_pings: " << initial_pings
                  << ", percent_mutlimessage: " << percent_multimessage
                  << std::endl;
@@ -265,7 +268,6 @@ int main(int argc, char** argv)
   all_cowns = (rt::Cown**)alloc->alloc(all_cowns_count * sizeof(rt::Cown*));
   memcpy(all_cowns, pinger_set.data(), pinger_set.size() * sizeof(rt::Cown*));
   all_cowns[pinger_set.size()] = monitor;
-
   rt::Cown::schedule<ubench::Start>(all_cowns_count, all_cowns, monitor);
 
   sched.run();

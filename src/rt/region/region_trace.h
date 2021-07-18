@@ -237,7 +237,7 @@ namespace verona::rt
      **/
     static void gc(Alloc* alloc, Object* o)
     {
-      Systematic::cout() << "Region GC called for: " << o << std::endl;
+      Systematic::cout() << "Region GC called for: " << o << Systematic::endl;
       assert(o->debug_is_iso());
       assert(is_trace_region(o->get_region()));
 
@@ -247,7 +247,7 @@ namespace verona::rt
 
       // Copy additional roots into f.
       reg->additional_entry_points.forall([&f](Object* o) {
-        Systematic::cout() << "Additional root: " << o << std::endl;
+        Systematic::cout() << "Additional root: " << o << Systematic::endl;
         f.push(o);
       });
 
@@ -261,7 +261,7 @@ namespace verona::rt
         o = collect.pop();
         assert(o->debug_is_iso());
         Systematic::cout() << "Region GC: releasing unreachable subregion: "
-                           << o << std::endl;
+                           << o << Systematic::endl;
 
         // Note that we need to dispatch because `r` is a different region
         // metadata object.
@@ -410,7 +410,7 @@ namespace verona::rt
             break;
 
           case Object::UNMARKED:
-            Systematic::cout() << "Mark" << p << std::endl;
+            Systematic::cout() << "Mark" << p << Systematic::endl;
             p->mark();
             p->trace(dfs);
             break;
@@ -471,7 +471,7 @@ namespace verona::rt
       Alloc* alloc,
       Object* p,
       Object* region,
-      Object** gc,
+      LinkedObjectStack* gc,
       ObjectStack& sub_regions)
     {
       assert(
@@ -501,8 +501,7 @@ namespace verona::rt
         // We can't deallocate the object yet, as other objects' finalisers may
         // look at it. We build up a linked list of all objects to delete, we'll
         // deallocate them after sweeping through the entire ring.
-        p->init_next(*gc);
-        *gc = p;
+        gc->push(p);
       }
     }
 
@@ -512,7 +511,7 @@ namespace verona::rt
     {
       Object* prev = this;
       Object* p = ring == primary_ring ? get_next() : next_not_root;
-      Object* gc = nullptr;
+      LinkedObjectStack gc;
 
       // Note: we don't use the iterator because we need to remove and
       // deallocate objects from the rings.
@@ -554,7 +553,7 @@ namespace verona::rt
           case Object::UNMARKED:
           {
             Object* q = p->get_next();
-            Systematic::cout() << "Sweep " << p << std::endl;
+            Systematic::cout() << "Sweep " << p << Systematic::endl;
             sweep_object<ring>(alloc, p, o, &gc, collect);
 
             if (ring != primary_ring && prev == this)
@@ -577,13 +576,11 @@ namespace verona::rt
       // Deallocate the objects, if not done in first pass.
       if constexpr (ring == NonTrivialRing)
       {
-        p = gc;
-        while (p != nullptr)
+        while (!gc.empty())
         {
-          Object* q = p->get_next();
-          p->destructor();
-          p->dealloc(alloc);
-          p = q;
+          Object* q = gc.pop();
+          q->destructor();
+          q->dealloc(alloc);
         }
       }
       else
@@ -607,13 +604,15 @@ namespace verona::rt
       if (!additional_entry_points.empty())
       {
         Systematic::cout() << "Region release failed due to additional roots"
-                           << std::endl;
-        additional_entry_points.forall(
-          [](Object* o) { Systematic::cout() << " root" << o << std::endl; });
+                           << Systematic::endl;
+        additional_entry_points.forall([](Object* o) {
+          Systematic::cout() << " root" << o << Systematic::endl;
+        });
         abort();
       }
 
-      Systematic::cout() << "Region release: trace region: " << o << std::endl;
+      Systematic::cout() << "Region release: trace region: " << o
+                         << Systematic::endl;
 
       // Sweep everything, including the entrypoint.
       sweep<SweepAll::Yes>(alloc, o, collect);

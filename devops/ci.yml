@@ -10,24 +10,37 @@ jobs:
 ############################################## Configure CI Run
 - job: ConfigureCIRun
   pool:
-    vmImage: 'ubuntu-18.04'
+    vmImage: 'ubuntu-20.04'
   steps:
   - script: |
-      echo " - PR Build"
-      if  git diff --ignore-submodules=dirty origin/master --name-only | grep -v "^doc" | grep -v "^experiments" | grep -v "\.md$"; then
-        echo Src changes;
-        echo "##vso[task.setvariable variable=docOnly;isOutput=true]false" #set variable to testRuntime to On
-        echo "Determine if runtime changed."
-        if git diff --ignore-submodules=dirty --quiet origin/master -- src/rt; then
-          echo " - Runtime unchanged!"
-          echo "##vso[task.setvariable variable=testRuntime;isOutput=true]Off" #set variable to testRuntime to Off
-        else
-          echo " - Runtime changed!"
-          echo "##vso[task.setvariable variable=testRuntime;isOutput=true]On" #set variable to testRuntime to On
-        fi
+      echo "Determine if any code has changed."
+      if git diff --ignore-submodules=dirty --quiet origin/master -- ':!docs' ':!experiments' ':!*.md'; then
+        echo " - Documentation change only"
+        echo "##vso[task.setvariable variable=docOnly;isOutput=true]true" #set variable docOnly to true
       else
-        echo Doc changes only;
-        echo "##vso[task.setvariable variable=docOnly;isOutput=true]true" #set variable to testRuntime to On
+        echo " - Source has changed"
+        echo "##vso[task.setvariable variable=docOnly;isOutput=true]false" #set variable docOnly to false
+      fi
+
+      echo "Determine if runtime changed."
+      if git diff --ignore-submodules=dirty --quiet origin/master -- src/rt; then
+        echo " - Runtime is unchanged!"
+        echo "##vso[task.setvariable variable=testRuntime;isOutput=true]Off" #set variable testRuntime to Off
+      else
+        echo " - Runtime has changed!"
+        echo "##vso[task.setvariable variable=testRuntime;isOutput=true]On" #set variable testRuntime to On
+      fi
+
+      echo "Determine if process-based sandbox changed."
+      # Check if the process sandbox code has changed, or snmalloc (which is
+      # tightly coupled to the process sandbox code) so that we can skip CI on
+      # the process sandbox code if it has not been modified.
+      if git diff --ignore-submodules=dirty --quiet origin/master -- experiments/process_sandbox external/snmalloc/; then
+       echo " - Process-based sandbox is unchanged!"
+       echo "##vso[task.setvariable variable=testProcSandbox;isOutput=true]Off" #set variable testProcSandbox to Off
+      else
+        echo " - Process-based sandbox has changed!"
+        echo "##vso[task.setvariable variable=testProcSandbox;isOutput=true]On" #set variable testProcSandbox to On
       fi
     displayName: 'Check for runtime changes'
     name: setVarStep
@@ -40,7 +53,7 @@ jobs:
   variables:
     RTTests: $[ dependencies.ConfigureCIRun.outputs['setVarStep.testRuntime'] ]
   pool:
-    vmImage: 'ubuntu-18.04'
+    vmImage: 'ubuntu-20.04'
   timeoutInMinutes: 120
   strategy:
     matrix:
@@ -71,7 +84,6 @@ jobs:
       sudo apt-get install -y ninja-build
       sudo apt-get remove --purge cmake
       sudo snap install cmake --classic
-      sudo pip install wheel OutputCheck
     displayName: 'Dependencies'
 
   - task: CMake@1
@@ -88,11 +100,77 @@ jobs:
 
   - script: |
       set -eo pipefail
-      export ASAN_SYMBOLIZER_PATH=/usr/lib/llvm-6.0/bin/llvm-symbolizer
       export ASAN_OPTIONS="alloc_dealloc_mismatch=0 symbolize=1"
       ninja check
     workingDirectory: build
     displayName: 'Tests'
+
+- job:
+  displayName: LinuxSandboxTests
+  dependsOn: ConfigureCIRun
+  condition: eq(dependencies.ConfigureCIRun.outputs['setVarStep.testProcSandbox'], 'On')
+  pool:
+    vmImage: 'ubuntu-20.04'
+  timeoutInMinutes: 120
+  strategy:
+    matrix:
+      GCC Release:
+        CC: gcc-10
+        CXX: g++-10
+        BuildType: Release
+      GCC Debug:
+        CC: gcc-10
+        CXX: g++-10
+        BuildType: Debug
+      Clang Release:
+        CC: clang
+        CXX: clang++
+        BuildType: Release
+      Clang Debug:
+        CC: clang
+        CXX: clang++
+        BuildType: Debug
+  steps:
+  - checkout: self
+
+  - script: |
+      set -eo pipefail
+      # Skip two huge submodules that aren't needed.  This should save about a
+      # minute of CI time for each instance of this job.
+      git -c submodule."external/llvm-project".update=none -c submodule."external/CLI11".update=none submodule update --depth 1 --init --recursive
+    displayName: 'Checkout submodules'
+
+  - script: |
+      set -eo pipefail
+      sudo apt-get update
+      sudo apt-get install -y ninja-build libbsd-dev libseccomp-dev libfmt-dev
+      sudo apt-get remove --purge cmake
+      sudo snap install cmake --classic
+    displayName: 'Dependencies'
+
+  - task: CMake@1
+    displayName: 'CMake'
+    inputs:
+      cmakeArgs: |
+        ../experiments/process_sandbox -GNinja -DCMAKE_BUILD_TYPE=$(BuildType) -DCMAKE_C_COMPILER=$(CC) -DCMAKE_CXX_COMPILER=$(CXX)
+
+  - script: |
+      set -eo pipefail
+      ninja
+    workingDirectory: build
+    displayName: 'Compile'
+
+  - script: |
+      ctest -j 4 --output-on-failure -T test
+    displayName: 'Test'
+    workingDirectory: build
+    failOnStderr: false
+
+  - task: PublishTestResults@2
+    inputs:
+        testResultsFormat: cTest
+        testResultsFiles: build/Testing/*/Test.xml
+
 
 ############################################## Windows Builds
 - job: 
@@ -118,26 +196,30 @@ jobs:
       git submodule update --depth 1 --recursive
     displayName: 'Checkout submodules'
 
-  - script:
-      pip install OutputCheck
-    displayName: 'Dependencies'
-
   - script: |
+      call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
       mkdir build
       cd build
-      cmake .. -G"Visual Studio 16 2019" -DENABLE_ASSERTS=ON -DVERONA_CI_BUILD=On -DRT_TESTS=$(RTTests) -DCMAKE_CXX_FLAGS="$(CXXFLAGS)"
+      cmake .. -GNinja -DCMAKE_BUILD_TYPE=$(BuildType) -DENABLE_ASSERTS=ON -DVERONA_CI_BUILD=On -DRT_TESTS=$(RTTests) -DCMAKE_CXX_FLAGS="$(CXXFLAGS)"
     displayName: 'CMake'
 
-  - task: MSBuild@1
-    displayName: 'Compile and Tests'
-    inputs:
-      solution: build/verona.sln
-      msbuildArguments: '/m /p:Configuration=$(BuildType)'
+  - script: |
+      call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+      cd build
+      ninja
+    displayName: 'Compile'
 
-  - task: ms.vss-governance-buildtask.governance-build-task-component-detection.ComponentGovernanceComponentDetection@0
-    displayName: 'Component Detection'
+  - script: |
+      call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+      cd build
+      ninja check
+    displayName: 'Test'
+
+  - task: ComponentGovernanceComponentDetection@0
     inputs:
-      failOnAlert: true
+      scanType: 'LogOnly'
+      verbosity: 'Verbose'
+      alertWarningLevel: 'High'
 
 ############################################## MacOS Builds
 - job: 
@@ -163,11 +245,6 @@ jobs:
       git submodule update --depth 1 --recursive
     displayName: 'Checkout submodules'
 
-  - script: |
-      set -eo pipefail
-      sudo pip install wheel OutputCheck
-    displayName: 'Dependencies'
-
   - task: CMake@1
     displayName: 'CMake'
     inputs:
@@ -191,15 +268,9 @@ jobs:
 - job: 
   displayName: Format
   pool:
-    vmImage: 'ubuntu-18.04'
+    vmImage: 'ubuntu-20.04'
   steps:
   - checkout: self
-
-  - script: |
-      set -eo pipefail
-      git submodule init
-      git submodule update --depth 1 --recursive
-    displayName: 'Update submodules'
 
   - script: |
       set -eo pipefail
@@ -225,9 +296,6 @@ jobs:
 
   - script: |
       set -eo pipefail
-      files=`git ls-files -- '*.cpp' '*.cc' '*.h' '*.hh' '*.verona' '*.td' '*.mlir' | xargs`
-      grep -L "Copyright Microsoft and Project Verona Contributors."  $files | tee header_missing
-      [ ! -s header_missing ]
-      grep -L "SPDX-License-Identifier: MIT" $files | tee header_missing
-      [ ! -s header_missing ]
+      make copyright
+    workingDirectory: build
     displayName: 'Check Copyright and License'

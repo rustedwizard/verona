@@ -3,10 +3,12 @@
 
 #pragma once
 
-#include "ast/ast.h"
-#include "mlir/IR/Function.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
+
+#include <map>
+#include <string>
 
 namespace mlir::verona
 {
@@ -15,10 +17,6 @@ namespace mlir::verona
    * and the MLIR ounterpart) in a scope. Creating a new scope makes
    * all future insertions happen at that level, destroying it pops
    * the scope out of the stack.
-   *
-   * New scopes are created by creating a new local variable like:
-   *   SymbolScopeT scope(symbolTable);
-   * The destructor pops the scope automatically.
    *
    * We cannot use LLVM's ADT/ScopedHashTable like MLIR's Toy example because
    * that coped hash table does not allow redefinition, which is a problem when
@@ -90,6 +88,23 @@ namespace mlir::verona
       return nullptr;
     }
 
+    /// Update value, used for assignments.
+    T update(llvm::StringRef key, T newValue)
+    {
+      for (auto it = stack.rbegin(), end = stack.rend(); it != end; it++)
+      {
+        auto& frame = *it;
+        auto val = frame.find(key.str());
+        if (val != frame.end())
+        {
+          auto old = val->second;
+          val->second = newValue;
+          return old;
+        }
+      }
+      return nullptr;
+    }
+
     /// Creates a new scope
     void pushScope()
     {
@@ -103,48 +118,9 @@ namespace mlir::verona
     }
   };
 
-  // FIXME: This is a hack to control scope. We can do better.
-  template<class T>
-  class ScopedTableScope
-  {
-    ScopedTable<T>& table;
-
-  public:
-    ScopedTableScope(ScopedTable<T>& table) : table(table)
-    {
-      table.pushScope();
-    }
-    ~ScopedTableScope()
-    {
-      table.popScope();
-    }
-  };
-
   /**
    * Variable symbols. New scopes should be created when entering classes,
    * functions, lexical blocks, lambdas, etc.
    */
   using SymbolTableT = ScopedTable<mlir::Value>;
-  using SymbolScopeT = ScopedTableScope<mlir::Value>;
-
-  /**
-   * Function Symbols. New scopes should be created when entering classes
-   * and sub-classes. Modules too, if we allow more than one per file.
-   */
-  using FunctionTableT = ScopedTable<mlir::FuncOp>;
-  using FunctionScopeT = ScopedTableScope<mlir::FuncOp>;
-
-  /**
-   * Type Symbols. New scopes should be created when entering classes
-   * sub-classes and functions, to be used with the 'where' keyword.
-   */
-  using TypeTableT = ScopedTable<mlir::Type>;
-  using TypeScopeT = ScopedTableScope<mlir::Type>;
-
-  /**
-   * Basic Block Symbols. New scopes should be created when entering loops
-   * to determine what is the head/exit block for 'break'/'continue'.
-   */
-  using BasicBlockTableT = ScopedTable<mlir::Block*>;
-  using BasicBlockScopeT = ScopedTableScope<mlir::Block*>;
 }
