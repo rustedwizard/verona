@@ -49,6 +49,7 @@ namespace verona::rt
   private:
     friend class Region;
     friend class RegionTrace;
+    friend class RegionRc;
 
     /**
      * An Arena is a large block of pre-allocated memory. It has an overhead of
@@ -276,10 +277,10 @@ namespace verona::rt
      * every object must contain a descriptor, so 0 is not a valid size.
      **/
     template<size_t size = 0>
-    static Object* create(Alloc* alloc, const Descriptor* desc)
+    static Object* create(Alloc& alloc, const Descriptor* desc)
     {
       void* p = Object::register_object(
-        alloc->alloc<vsizeof<RegionArena>>(), RegionArena::desc());
+        alloc.alloc<vsizeof<RegionArena>>(), RegionArena::desc());
       RegionArena* reg = new (p) RegionArena();
 
       // o might be allocated in the arena or the large object ring.
@@ -306,7 +307,7 @@ namespace verona::rt
      * every object must contain a descriptor, so 0 is not a valid size.
      **/
     template<size_t size = 0>
-    static Object* alloc(Alloc* alloc, Object* in, const Descriptor* desc)
+    static Object* alloc(Alloc& alloc, Object* in, const Descriptor* desc)
     {
       RegionArena* reg = get(in);
       Object* o = reg->alloc_internal<size>(alloc, desc);
@@ -326,7 +327,7 @@ namespace verona::rt
      * the caller to cast?
      **/
     template<TransferOwnership transfer = NoTransfer>
-    static void insert(Alloc* alloc, Object* into, Object* o)
+    static void insert(Alloc& alloc, Object* into, Object* o)
     {
       assert(o->debug_is_immutable() || o->debug_is_cown());
       RegionArena* reg = get(into);
@@ -342,7 +343,7 @@ namespace verona::rt
      *
      * TODO(region): how to handle merging different types of regions?
      **/
-    static void merge(Alloc* alloc, Object* into, Object* o)
+    static void merge(Alloc& alloc, Object* into, Object* o)
     {
       assert(o->debug_is_iso());
       RegionArena* reg = get(into);
@@ -418,7 +419,7 @@ namespace verona::rt
      * e.g. first fit or best fit.
      **/
     template<size_t size = 0>
-    Object* alloc_internal(Alloc* alloc, const Descriptor* desc)
+    Object* alloc_internal(Alloc& alloc, const Descriptor* desc)
     {
       assert((size == 0) || (desc->size == size));
 
@@ -428,9 +429,9 @@ namespace verona::rt
         // Allocate object.
         void* p = nullptr;
         if constexpr (size == 0)
-          p = alloc->alloc(desc->size);
+          p = alloc.alloc(desc->size);
         else
-          p = alloc->alloc<size>();
+          p = alloc.alloc<size>();
 
         auto o = Object::register_object(p, desc);
 
@@ -444,7 +445,7 @@ namespace verona::rt
       // allocate a new arena.
       if (last_arena == nullptr || last_arena->free_space() < sz)
       {
-        void* p = alloc->alloc<sizeof(Arena)>();
+        void* p = alloc.alloc<sizeof(Arena)>();
         Arena* a = new (p) Arena();
 
         if (last_arena == nullptr)
@@ -543,7 +544,7 @@ namespace verona::rt
      *
      * Note: this does not release subregions. Use Region::release instead.
      **/
-    void release_internal(Alloc* alloc, Object* o, ObjectStack& collect)
+    void release_internal(Alloc& alloc, Object* o, ObjectStack& collect)
     {
       assert(o->debug_is_iso());
       // Don't trace or finalise o, we'll do it when looping over the large
@@ -585,7 +586,7 @@ namespace verona::rt
       while (arena != nullptr)
       {
         Arena* q = arena->next;
-        alloc->dealloc<sizeof(Arena)>(arena);
+        alloc.dealloc<sizeof(Arena)>(arena);
         arena = q;
       }
 

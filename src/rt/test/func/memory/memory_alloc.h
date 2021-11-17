@@ -16,10 +16,10 @@ namespace memory_alloc
   template<class First, class... Rest>
   void test_alloc_helper()
   {
-    auto* alloc = ThreadAlloc::get();
+    auto& alloc = ThreadAlloc::get();
     First* a = alloc_region<First, Rest...>(alloc);
     Region::release(alloc, a);
-    snmalloc::current_alloc_pool()->debug_check_empty();
+    snmalloc::debug_check_empty<snmalloc::Alloc::StateHandle>();
     check(live_count == 0);
   }
 
@@ -145,6 +145,16 @@ namespace memory_alloc
       // 2nd arena: MF MC F F
       // 3rd arena: MC MC C C
       test_alloc_helper<MC, MF, C, F, MF, MC, F, F, MC, MC, C, C>();
+    }
+    else if constexpr (region_type == RegionType::Rc)
+    {
+      // Region contains only the iso object.
+      test_alloc_helper<C>();
+
+      test_alloc_helper<C, C, C>();
+      test_alloc_helper<F, F, F>();
+      test_alloc_helper<C, C, F, F>();
+      test_alloc_helper<F, F, C, C>();
     }
   }
 

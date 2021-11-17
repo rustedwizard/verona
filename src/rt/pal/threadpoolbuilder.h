@@ -1,11 +1,10 @@
 // Copyright Microsoft and Project Verona Contributors.
 // SPDX-License-Identifier: MIT
-
 #pragma once
 
-#include "cpu.h"
+#include "threading.h"
 
-#include <thread>
+#include <list>
 
 /**
  * This constructs a platforms affinitised set of threads.
@@ -14,8 +13,8 @@ namespace verona::rt
 {
   class ThreadPoolBuilder
   {
-    Topology topology;
-    std::thread* threads;
+    inline static Singleton<Topology, &Topology::init> topology;
+    std::list<PlatformThread> threads;
     size_t thread_count;
     size_t index = 0;
 
@@ -24,11 +23,11 @@ namespace verona::rt
     {
       if (index < thread_count)
       {
-        threads[index] = std::thread(body, args...);
+        threads.emplace_back(body, args...);
       }
       else
       {
-        abort();
+        body(args...);
       }
     }
 
@@ -41,10 +40,9 @@ namespace verona::rt
     }
 
   public:
-    ThreadPoolBuilder(size_t thread_count) : thread_count(thread_count)
+    ThreadPoolBuilder(size_t thread_count)
     {
-      threads = new std::thread[thread_count];
-      topology.acquire();
+      this->thread_count = thread_count - 1;
     }
 
     /**
@@ -59,7 +57,8 @@ namespace verona::rt
       // thread to a core we massively increase contention.
       add_thread_impl(body, args...);
 #else
-      add_thread_impl(&run_with_affinity, topology.get(index), body, args...);
+      add_thread_impl(
+        &run_with_affinity, topology.get().get(index), body, args...);
 #endif
       index++;
     }
@@ -67,23 +66,20 @@ namespace verona::rt
     /**
      * The destructor waits for all threads to finish, and
      * then tidies up.
+     *
+     *  The number of executions is one larger than the number of threads
+     * created as there is also the main thread.
      */
     ~ThreadPoolBuilder()
     {
-      assert(index == thread_count);
-      for (size_t i = 0; i < thread_count; i++)
+      assert(index == thread_count + 1);
+
+      while (!threads.empty())
       {
-        threads[i].join();
+        auto& thread = threads.front();
+        thread.join();
+        threads.pop_front();
       }
-
-      for (size_t i = 0; i < thread_count; i++)
-      {
-        threads[i].~thread();
-      }
-
-      delete[] threads;
-
-      topology.release();
     }
   };
 }

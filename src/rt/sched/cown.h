@@ -11,6 +11,8 @@
 #include "priority.h"
 #include "schedulerthread.h"
 
+#include <algorithm>
+
 namespace verona::rt
 {
   using namespace snmalloc;
@@ -70,7 +72,7 @@ namespace verona::rt
 
       if (initialise)
       {
-        auto alloc = ThreadAlloc::get();
+        auto& alloc = ThreadAlloc::get();
         auto epoch = Scheduler::alloc_epoch();
         set_epoch(epoch);
         queue.init(stub_msg(alloc));
@@ -100,7 +102,7 @@ namespace verona::rt
     friend class Noticeboard;
 
     template<typename T>
-    friend class SPMCQ;
+    friend class MPMCQ;
 
     static constexpr auto NO_EPOCH_SET = (std::numeric_limits<uint64_t>::max)();
 
@@ -133,8 +135,7 @@ namespace verona::rt
     {
       static constexpr Descriptor desc = {
         vsizeof<Cown>, nullptr, nullptr, nullptr};
-      auto alloc = ThreadAlloc::get();
-      auto p = alloc->alloc<desc.size>();
+      auto p = ThreadAlloc::get().alloc<desc.size>();
       auto o = Object::register_object(p, &desc);
       auto a = new (o) Cown(false);
 
@@ -172,7 +173,7 @@ namespace verona::rt
 #ifdef USE_SYSTEMATIC_TESTING_WEAK_NOTICEBOARDS
     std::vector<BaseNoticeboard*> noticeboards;
 
-    void flush_all(Alloc* alloc)
+    void flush_all(Alloc& alloc)
     {
       for (auto b : noticeboards)
       {
@@ -180,7 +181,7 @@ namespace verona::rt
       }
     }
 
-    void flush_some(Alloc* alloc)
+    void flush_some(Alloc& alloc)
     {
       for (auto b : noticeboards)
       {
@@ -223,7 +224,7 @@ namespace verona::rt
       o->incref();
     }
 
-    static void release(Alloc* alloc, Cown* o)
+    static void release(Alloc& alloc, Cown* o)
     {
       Systematic::cout() << "Cown " << o << " release" << Systematic::endl;
       assert(o->debug_is_cown());
@@ -279,7 +280,7 @@ namespace verona::rt
     /**
      * Release a weak reference to this cown.
      **/
-    void weak_release(Alloc* alloc)
+    void weak_release(Alloc& alloc)
     {
       Systematic::cout() << "Cown " << this << " weak release"
                          << Systematic::endl;
@@ -390,7 +391,7 @@ namespace verona::rt
       return result;
     }
 
-    void dealloc(Alloc* alloc)
+    void dealloc(Alloc& alloc)
     {
       Object::dealloc(alloc);
       yield();
@@ -401,7 +402,7 @@ namespace verona::rt
       return in_epoch(epoch);
     }
 
-    void scan(Alloc* alloc, EpochMark epoch)
+    void scan(Alloc& alloc, EpochMark epoch)
     {
       // Scan our data for cown references.
       if (!cown_scanned(epoch))
@@ -414,7 +415,7 @@ namespace verona::rt
       }
     }
 
-    static void scan_stack(Alloc* alloc, EpochMark epoch, ObjectStack& f)
+    static void scan_stack(Alloc& alloc, EpochMark epoch, ObjectStack& f)
     {
       while (!f.empty())
       {
@@ -482,7 +483,7 @@ namespace verona::rt
      **/
     static void fast_send(MultiMessage::MultiMessageBody* body, EpochMark epoch)
     {
-      auto* alloc = ThreadAlloc::get();
+      auto& alloc = ThreadAlloc::get();
       const auto last = body->count - 1;
       assert(body->index <= last);
 
@@ -597,7 +598,7 @@ namespace verona::rt
     static bool run_step(MultiMessage* m)
     {
       MultiMessage::MultiMessageBody& body = *(m->get_body());
-      Alloc* alloc = ThreadAlloc::get();
+      Alloc& alloc = ThreadAlloc::get();
       size_t last = body.count - 1;
       auto cown = body.cowns[m->get_body()->index];
 
@@ -712,14 +713,17 @@ namespace verona::rt
       body.behaviour->f();
 
       for (size_t i = 0; i < body.count; i++)
-        Cown::release(alloc, body.cowns[i]);
+      {
+        if (body.cowns[i])
+          Cown::release(alloc, body.cowns[i]);
+      }
 
       Systematic::cout() << "MultiMessage " << m << " completed and running on "
                          << cown << Systematic::endl;
 
       // Free the body and the behaviour.
-      alloc->dealloc(body.behaviour, body.behaviour->size());
-      alloc->dealloc<sizeof(MultiMessage::MultiMessageBody)>(m->get_body());
+      alloc.dealloc(body.behaviour, body.behaviour->size());
+      alloc.dealloc<sizeof(MultiMessage::MultiMessageBody)>(m->get_body());
 
       return true;
     }
@@ -752,10 +756,10 @@ namespace verona::rt
       Systematic::cout() << "Schedule behaviour of type: " << typeid(Be).name()
                          << Systematic::endl;
 
-      auto* alloc = ThreadAlloc::get();
+      auto& alloc = ThreadAlloc::get();
       auto* be =
-        new ((Be*)alloc->alloc<sizeof(Be)>()) Be(std::forward<Args>(args)...);
-      auto** sort = (Cown**)alloc->alloc(count * sizeof(Cown*));
+        new ((Be*)alloc.alloc<sizeof(Be)>()) Be(std::forward<Args>(args)...);
+      auto** sort = (Cown**)alloc.alloc(count * sizeof(Cown*));
       memcpy(sort, cowns, count * sizeof(Cown*));
 
 #ifdef USE_SYSTEMATIC_TESTING
@@ -840,8 +844,10 @@ namespace verona::rt
     }
 
     /// Recursively raise the priority of the given cown and its blocker.
-    static inline void
-    backpressure_unblock(Cown* cown, Epoch epoch = Epoch(ThreadAlloc::get()))
+    /// Either an Epoch object needs to be held in the calling context or one is
+    /// created for the lifetime of the call.
+    static inline void backpressure_unblock(
+      Cown* cown, const Epoch& epoch = Epoch(ThreadAlloc::get()))
     {
       UNUSED(epoch);
       for (; cown != nullptr;
@@ -926,7 +932,7 @@ namespace verona::rt
     /// Update priority based on the occurrence of a token message, or replace
     /// the token if it is not in the queue. Return true if the current message
     /// is a token.
-    inline bool check_token_message(Alloc* alloc, MessageBody* curr)
+    inline bool check_token_message(Alloc& alloc, MessageBody* curr)
     {
       auto bp = bp_state.load(std::memory_order_acquire);
 
@@ -970,7 +976,7 @@ namespace verona::rt
       return false;
     }
 
-    inline bool check_unmute_message(Alloc* alloc, MessageBody* msg)
+    inline bool check_unmute_message(Alloc& alloc, MessageBody* msg)
     {
       if (msg->behaviour != &unmute_behaviour)
         return false;
@@ -986,8 +992,8 @@ namespace verona::rt
         Cown::release(alloc, cown);
       }
 
-      alloc->dealloc(msg->cowns, msg->count * sizeof(Cown*));
-      alloc->dealloc<sizeof(MessageBody)>(msg);
+      alloc.dealloc(msg->cowns, msg->count * sizeof(Cown*));
+      alloc.dealloc<sizeof(MessageBody)>(msg);
 
       return true;
     }
@@ -996,7 +1002,7 @@ namespace verona::rt
     /// set the mutor during the behaviour. If false is returned, the caller
     /// must reschedule the senders and deallocate the senders array.
     inline bool apply_backpressure(
-      Alloc* alloc, EpochMark epoch, Cown** senders, size_t count)
+      Alloc& alloc, EpochMark epoch, Cown** senders, size_t count)
     {
       auto* mutor = Scheduler::local()->mutor;
       if (mutor == nullptr)
@@ -1012,6 +1018,8 @@ namespace verona::rt
       for (size_t i = 0; i < count; i++)
       {
         auto* cown = senders[i];
+        if (!cown)
+          continue;
         auto bp = cown->bp_state.load(std::memory_order_relaxed);
         const bool high_priority = bp.high_priority();
         yield();
@@ -1057,7 +1065,7 @@ namespace verona::rt
 
       if (muting_count == 0)
       {
-        alloc->dealloc(senders, count * sizeof(Cown*));
+        alloc.dealloc(senders, count * sizeof(Cown*));
         Cown::release(alloc, mutor);
         return true;
       }
@@ -1090,7 +1098,7 @@ namespace verona::rt
      * called, and it is guaranteed to return true, so it will be rescheduled
      * or false if it is part of a multi-message acquire.
      **/
-    bool run(Alloc* alloc, ThreadState::State, EpochMark epoch)
+    bool run(Alloc& alloc, ThreadState::State, EpochMark epoch)
     {
       auto until = queue.peek_back();
       yield(); // Reading global state in peek_back().
@@ -1196,16 +1204,19 @@ namespace verona::rt
 
         // Reschedule the other cowns.
         for (size_t s = 0; s < (senders_count - 1); s++)
-          senders[s]->schedule();
+        {
+          if (senders[s])
+            senders[s]->schedule();
+        }
 
-        alloc->dealloc(senders, senders_count * sizeof(Cown*));
+        alloc.dealloc(senders, senders_count * sizeof(Cown*));
 
       } while ((curr != until) && (batch_size < batch_limit));
 
       return true;
     }
 
-    bool try_collect(Alloc* alloc, EpochMark epoch)
+    bool try_collect(Alloc& alloc, EpochMark epoch)
     {
       Systematic::cout() << "try_collect: " << this << " (" << get_epoch_mark()
                          << ")" << Systematic::endl;
@@ -1249,7 +1260,7 @@ namespace verona::rt
      * Uses thread_local state to deal with deep deallocation
      * chains by queuing recursive calls.
      **/
-    void queue_collect(Alloc* alloc)
+    void queue_collect(Alloc& alloc)
     {
       thread_local ObjectStack* work_list = nullptr;
 
@@ -1280,7 +1291,7 @@ namespace verona::rt
       work_list = nullptr;
     }
 
-    void collect(Alloc* alloc)
+    void collect(Alloc& alloc)
     {
       // If this was collected by leak detector, then don't double dealloc
       // cown body, when the ref count drops.
@@ -1340,13 +1351,40 @@ namespace verona::rt
       // All messages must have been run by the time the cown is collected.
       assert(stub->next.load(std::memory_order_relaxed) == nullptr);
 
-      alloc->dealloc<sizeof(MultiMessage)>(stub);
+      alloc.dealloc<sizeof(MultiMessage)>(stub);
+    }
+
+    bool release_early()
+    {
+      auto* body = Scheduler::local()->message_body;
+      auto* senders = body->cowns;
+      const size_t senders_count = body->count;
+      Alloc& alloc = ThreadAlloc::get();
+
+      /*
+       * Avoid releasing the last cown because it breaks the current
+       * code structure
+       */
+      if (this == senders[senders_count - 1])
+        return false;
+
+      for (size_t s = 0; s < senders_count; s++)
+      {
+        if (senders[s] != this)
+          continue;
+        Cown::release(alloc, senders[s]);
+        senders[s]->schedule();
+        senders[s] = nullptr;
+        break;
+      }
+
+      return true;
     }
 
     /**
      * Create a `MultiMessage` that is never sent or processed.
      */
-    static MultiMessage* stub_msg(Alloc* alloc)
+    static MultiMessage* stub_msg(Alloc& alloc)
     {
       return MultiMessage::make_message(alloc, nullptr, EpochMark::EPOCH_NONE);
     }
@@ -1357,7 +1395,7 @@ namespace verona::rt
      * pointers that indicates the size of the allocation.
      */
     static MultiMessage*
-    unmute_msg(Alloc* alloc, size_t count, Cown** cowns, EpochMark epoch)
+    unmute_msg(Alloc& alloc, size_t count, Cown** cowns, EpochMark epoch)
     {
       auto* body =
         MultiMessage::make_body(alloc, count, cowns, &unmute_behaviour);
@@ -1367,7 +1405,7 @@ namespace verona::rt
 
   namespace cown
   {
-    inline void release(Alloc* alloc, Cown* o)
+    inline void release(Alloc& alloc, Cown* o)
     {
       Cown::release(alloc, o);
     }
@@ -1404,8 +1442,10 @@ namespace Systematic
     }
     std::stringstream ss;
     bool short_id = external_id <= 26;
-    size_t spaces = short_id ? 9 : 8;
-    size_t offset = (external_id - 1) % spaces;
+    unsigned char spaces = short_id ? 9 : 8;
+    // Modulo guarantees that this fits into the same type as spaces.
+    decltype(spaces) offset =
+      static_cast<decltype(spaces)>((external_id - 1) % spaces);
     if (offset != 0)
       ss << std::setw(spaces - offset) << " ";
     if (short_id)

@@ -5,6 +5,7 @@
 #include "../object/object.h"
 #include "region_arena.h"
 #include "region_base.h"
+#include "region_rc.h"
 #include "region_trace.h"
 
 namespace verona::rt
@@ -84,6 +85,12 @@ namespace verona::rt
     using T = RegionArena;
   };
 
+  template<>
+  struct RegionType_to_class<RegionType::Rc>
+  {
+    using T = RegionRc;
+  };
+
   class Region
   {
   public:
@@ -99,6 +106,8 @@ namespace verona::rt
         return RegionType::Trace;
       else if (RegionArena::is_arena_region(o))
         return RegionType::Arena;
+      else if (RegionRc::is_rc_region(o))
+        return RegionType::Rc;
 
       abort();
     }
@@ -112,7 +121,7 @@ namespace verona::rt
      * every object must contain a descriptor, so 0 is not a valid size.
      **/
     template<size_t size = 0>
-    static Object* alloc(Alloc* alloc, Object* in, const Descriptor* desc)
+    static Object* alloc(Alloc& alloc, Object* in, const Descriptor* desc)
     {
       assert(in->debug_is_iso());
       switch (Region::get_type(in->get_region()))
@@ -121,6 +130,8 @@ namespace verona::rt
           return RegionTrace::alloc<size>(alloc, in, desc);
         case RegionType::Arena:
           return RegionArena::alloc<size>(alloc, in, desc);
+        case RegionType::Rc:
+          return RegionRc::alloc<size>(alloc, in, desc);
         default:
           abort();
       }
@@ -131,7 +142,7 @@ namespace verona::rt
      * subregions. This is used to keep reachable cowns alive and prevent them
      * from being collected by the leak detector.
      **/
-    static void cown_scan(Alloc* alloc, Object* o, EpochMark epoch)
+    static void cown_scan(Alloc& alloc, Object* o, EpochMark epoch)
     {
       ObjectStack f(alloc);
       ObjectStack recurse(alloc);
@@ -164,7 +175,7 @@ namespace verona::rt
      * As we discover Iso pointers to other regions, we add them to our
      * worklist.
      **/
-    static void release(Alloc* alloc, Object* o)
+    static void release(Alloc& alloc, Object* o)
     {
       assert(o->debug_is_iso());
       ObjectStack collect(alloc);
@@ -218,6 +229,13 @@ namespace verona::rt
             count++;
           }
           return count;
+        case RegionType::Rc:
+          for (auto p : *((RegionRc*)r))
+          {
+            UNUSED(p);
+            count++;
+          }
+          return count;
         default:
           abort();
       }
@@ -239,7 +257,7 @@ namespace verona::rt
      **/
     template<class RegionType>
     static void cown_scan_internal(
-      Alloc* alloc,
+      Alloc& alloc,
       Object* o,
       ObjectStack& f,
       ObjectStack& recurse,
@@ -299,7 +317,7 @@ namespace verona::rt
      *
      * We dispatch based on the type of region represented by `o`.
      **/
-    static void release_internal(Alloc* alloc, Object* o, ObjectStack& collect)
+    static void release_internal(Alloc& alloc, Object* o, ObjectStack& collect)
     {
       assert(o->debug_is_iso());
       RegionBase* r = o->get_region();
@@ -310,6 +328,9 @@ namespace verona::rt
           return;
         case RegionType::Arena:
           ((RegionArena*)r)->release_internal(alloc, o, collect);
+          return;
+        case RegionType::Rc:
+          ((RegionRc*)r)->release_internal(alloc, o, collect);
           return;
         default:
           abort();

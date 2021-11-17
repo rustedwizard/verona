@@ -6,7 +6,9 @@
 #  include <DbgHelp.h>
 #  include <windows.h>
 #  pragma comment(lib, "dbghelp.lib")
-#elif USE_EXECINFO
+#elif defined(USE_EXECINFO)
+#  include "threadping.h"
+
 #  include <condition_variable>
 #  include <csignal>
 #  include <cxxabi.h>
@@ -116,8 +118,6 @@ namespace Systematic
   private:
     friend class ThreadLocalLog;
     friend class SysLog;
-    template<class L, typename M>
-    friend class snmalloc::Pool;
 
 #ifdef USE_FLIGHT_RECORDER
     static constexpr size_t size =
@@ -231,12 +231,7 @@ namespace Systematic
     }
   };
 
-  inline snmalloc::Pool<LocalLog>& global_logs()
-  {
-    return *snmalloc::Singleton<
-      snmalloc::Pool<LocalLog>*,
-      snmalloc::Pool<LocalLog>::make>::get();
-  };
+  using LocalLogPool = snmalloc::Pool<LocalLog, snmalloc::Alloc::StateHandle>;
 
   class ThreadLocalLog
   {
@@ -245,11 +240,11 @@ namespace Systematic
 
     LocalLog* log = nullptr;
 #ifdef USE_FLIGHT_RECORDER
-    ThreadLocalLog() : log(global_logs().acquire()) {}
+    ThreadLocalLog() : log(LocalLogPool::acquire()) {}
 
     ~ThreadLocalLog()
     {
-      global_logs().release(log);
+      LocalLogPool::release(log);
     }
 #endif
 
@@ -269,13 +264,13 @@ namespace Systematic
         o << "THIS IS BACKWARDS COMPARED TO THE NORMAL LOG!" << std::endl;
 
         // Set up all logs for dumping
-        auto curr = global_logs().iterate();
+        auto curr = LocalLogPool::iterate();
         auto mine = get().log;
 
         while (curr != nullptr)
         {
           curr->suspend_logging(curr != mine);
-          curr = global_logs().iterate(curr);
+          curr = LocalLogPool::iterate(curr);
         }
 
         LocalLog* next = nullptr;
@@ -283,7 +278,7 @@ namespace Systematic
         {
           next = nullptr;
           size_t t1 = 0;
-          curr = global_logs().iterate();
+          curr = LocalLogPool::iterate();
 
           while (curr != nullptr)
           {
@@ -296,7 +291,7 @@ namespace Systematic
                 t1 = t2;
               }
             }
-            curr = global_logs().iterate(curr);
+            curr = LocalLogPool::iterate(curr);
           }
 
           if (next == nullptr)
@@ -305,11 +300,11 @@ namespace Systematic
           next->pop_and_print(o);
         }
 
-        curr = global_logs().iterate();
+        curr = LocalLogPool::iterate();
         while (curr != nullptr)
         {
           curr->resume_logging(curr != mine);
-          curr = global_logs().iterate(curr);
+          curr = LocalLogPool::iterate(curr);
         }
 
         o.flush();
@@ -328,9 +323,9 @@ namespace Systematic
     std::ostream* o;
     bool first;
 
-    static stringstream& get_ss()
+    static std::stringstream& get_ss()
     {
-      static thread_local stringstream ss;
+      static thread_local std::stringstream ss;
       return ss;
     }
 
@@ -509,105 +504,108 @@ namespace Systematic
   }
 
 #elif defined(CI_BUILD) && defined(USE_EXECINFO)
-  static std::mutex mutx;
-  static std::condition_variable cv;
   static void* stack_frames = nullptr;
   static int n_frames = 0;
   static std::string systematic_id = "";
 
-  inline static void signal_handler(int sig, siginfo_t*, void*)
-  {
-    static std::atomic<bool> run_already = false;
-
-    if (run_already)
-      abort();
-    run_already = true;
-
-    auto str = strsignal(sig);
-
-    // We're ignoring the result of write, as there's not much we can do if it
-    // fails. We're about to crash anyway.
-    auto s1 = write(1, str, strlen(str));
-    auto s2 = write(1, "\n", 1);
-    UNUSED(s1 + s2);
-
-    constexpr size_t max_stack_frames = 64;
-    void* frames[max_stack_frames];
-    {
-      std::lock_guard<std::mutex> lock(mutx);
-      n_frames = backtrace(frames, max_stack_frames);
-      stack_frames = frames;
-      systematic_id = get_systematic_id();
-      cv.notify_one();
-    }
-    while (true)
-    {
-      sleep(1000);
-    }
-  }
-
   inline static void crash_dump()
   {
-    std::unique_lock<std::mutex> lock(mutx);
-    cv.wait(lock, [] { return stack_frames != nullptr; });
-    if (n_frames == 0)
-    {
-      return;
-    }
+    // This can't happen as this is only in response to a ping,
+    // but GCC complains, and this is not fast path, so additional
+    // check is not a problem.
+    if (stack_frames == nullptr)
+      abort();
 
+    // Stop handling abort signals.
     auto* sa = new struct sigaction;
     sa->sa_handler = SIG_DFL;
     sigaction(SIGABRT, sa, nullptr);
 
+    // Attempt to print stack trace
     auto syms = backtrace_symbols((void* const*)stack_frames, n_frames);
-    if (syms == nullptr)
+    if (syms != nullptr)
     {
-      abort();
-    }
-
-    constexpr size_t buf_size = 1024;
-    char buf[buf_size];
-    auto demangle_buf = static_cast<char*>(malloc(sizeof(char) * buf_size));
-    for (auto i = 2; i < n_frames; i++)
-    {
-      auto* sym = syms[i];
+      constexpr size_t buf_size = 1024;
+      char buf[buf_size];
+      auto demangle_buf = static_cast<char*>(malloc(sizeof(char) * buf_size));
+      for (auto i = 2; i < n_frames; i++)
+      {
+        auto* sym = syms[i];
 #  ifdef __APPLE__
-      // macOS symbol format: index  module   address function + offset
-      auto* mangled_end = strrchr(sym, '+') - 1;
-      *mangled_end = 0;
-      auto* mangled_begin = strrchr(sym, ' ') + 1;
-      *mangled_end = ' ';
+        // macOS symbol format: index  module   address function + offset
+        auto* mangled_end = strrchr(sym, '+') - 1;
+        *mangled_end = 0;
+        auto* mangled_begin = strrchr(sym, ' ') + 1;
+        *mangled_end = ' ';
 #  else
-      // symbol format: module(function+offset) [address]
-      auto* mangled_begin = strchr(sym, '(') + 1;
-      auto* mangled_end = strchr(sym, '+');
+        // symbol format: module(function+offset) [address]
+        auto* mangled_begin = strchr(sym, '(') + 1;
+        auto* mangled_end = strchr(sym, '+');
 #  endif
-      auto* sym_end = sym + strlen(sym);
-      if (
-        (mangled_begin < sym) || (mangled_end > sym_end) ||
-        (mangled_end <= mangled_begin))
-      {
-        std::cerr << sym << std::endl;
-        continue;
-      }
-      size_t mangled_len = (size_t)(mangled_end - mangled_begin);
-      strncpy(buf, mangled_begin, mangled_len);
-      buf[mangled_len] = 0;
-      auto err = 0;
-      auto size = buf_size;
-      char* demangled = abi::__cxa_demangle(buf, demangle_buf, &size, &err);
-      if (!err)
-      {
-        std::cerr.write(sym, mangled_begin - sym);
-        std::cerr << demangled << mangled_end << std::endl;
-      }
-      else
-      {
-        std::cerr << sym << std::endl;
+        auto* sym_end = sym + strlen(sym);
+        if (
+          (mangled_begin < sym) || (mangled_end > sym_end) ||
+          (mangled_end <= mangled_begin))
+        {
+          std::cerr << sym << std::endl;
+          continue;
+        }
+        size_t mangled_len = (size_t)(mangled_end - mangled_begin);
+        strncpy(buf, mangled_begin, mangled_len);
+        buf[mangled_len] = 0;
+        auto err = 0;
+        auto size = buf_size;
+        char* demangled = abi::__cxa_demangle(buf, demangle_buf, &size, &err);
+        if (!err)
+        {
+          std::cerr.write(sym, mangled_begin - sym);
+          std::cerr << demangled << mangled_end << std::endl;
+        }
+        else
+        {
+          std::cerr << sym << std::endl;
+        }
       }
     }
     SysLog::dump_flight_recorder(systematic_id);
     abort();
+  }
+
+  /// Encapsulates thread that handles crash dump
+  static verona::rt::ThreadPing crash_thread{&crash_dump};
+
+  inline static void signal_handler(int sig, siginfo_t*, void*)
+  {
+    static std::atomic_flag run_already{};
+
+    constexpr size_t max_stack_frames = 64;
+    void* frames[max_stack_frames];
+
+    // Ignore subsequent calls.
+    if (!run_already.test_and_set())
+    {
+      auto str = strsignal(sig);
+
+      // We're ignoring the result of write, as there's not much we can do if it
+      // fails. We're about to crash anyway.
+      auto s1 = write(1, str, strlen(str));
+      auto s2 = write(1, "\n", 1);
+      UNUSED(s1 + s2);
+
+      // Set up data for the crash dump
+      n_frames = backtrace(frames, max_stack_frames);
+      stack_frames = frames;
+      systematic_id = get_systematic_id();
+
+      // Nudge crash dump thread to output data.
+      crash_thread.ping();
+
+      // Need to not return so frames[max_stack_frames] still exists.
+      while (true)
+      {
+        sleep(1000);
+      }
+    }
   }
 #endif
 
@@ -616,15 +614,6 @@ namespace Systematic
 #if defined(CI_BUILD) && defined(_MSC_VER)
     AddVectoredExceptionHandler(0, &ExceptionHandler);
 #elif defined(CI_BUILD) && defined(USE_EXECINFO)
-    static std::thread thr = std::thread(&crash_dump);
-    thr.detach();
-    std::atexit([] {
-      std::lock_guard<std::mutex> lock(mutx);
-      stack_frames = (void*)-1;
-      n_frames = 0;
-      cv.notify_all();
-    });
-
     static struct sigaction sa;
     sa.sa_sigaction = signal_handler;
     sa.sa_flags = SA_SIGINFO;
@@ -648,7 +637,7 @@ namespace Systematic
     return cout_log;
   }
 
-  inline ostream& endl(ostream& os)
+  inline std::ostream& endl(std::ostream& os)
   {
     if constexpr (systematic || flight_recorder)
     {

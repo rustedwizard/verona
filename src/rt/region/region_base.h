@@ -23,6 +23,7 @@ namespace verona::rt
   {
     Trace,
     Arena,
+    Rc,
   };
 
   class RegionBase : public Object,
@@ -32,6 +33,7 @@ namespace verona::rt
     friend class Freeze;
     friend class RegionTrace;
     friend class RegionArena;
+    friend class RegionRc;
 
   public:
     enum IteratorType
@@ -44,7 +46,7 @@ namespace verona::rt
     RegionBase() : Object() {}
 
   private:
-    inline void dealloc(Alloc* alloc)
+    inline void dealloc(Alloc& alloc)
     {
       ExternalReferenceTable::dealloc(alloc);
       RememberedSet::dealloc(alloc);

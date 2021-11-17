@@ -8,6 +8,7 @@
 #endif
 
 #include "cpp/lambdabehaviour.h"
+#include "cpp/promise.h"
 #include "cpp/vbehaviour.h"
 #include "cpp/vobject.h"
 #include "object/object.h"
@@ -17,10 +18,10 @@
 #include "region/region.h"
 #include "sched/cown.h"
 #include "sched/epoch.h"
+#include "sched/mpmcq.h"
 #include "sched/multimessage.h"
 #include "sched/noticeboard.h"
 #include "sched/schedulerthread.h"
-#include "sched/spmcq.h"
 #include "test/systematic.h"
 
 #include <snmalloc.h>

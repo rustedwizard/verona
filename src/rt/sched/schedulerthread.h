@@ -4,14 +4,13 @@
 
 #include "ds/hashmap.h"
 #include "ds/mpscq.h"
+#include "mpmcq.h"
 #include "object/object.h"
 #include "priority.h"
 #include "schedulerstats.h"
-#include "spmcq.h"
 #include "threadpool.h"
 
 #include <snmalloc.h>
-#include <thread>
 
 namespace verona::rt
 {
@@ -62,7 +61,7 @@ namespace verona::rt
     size_t steps = 0;
 #endif
 
-    SPMCQ<T> q;
+    MPMCQ<T> q;
     Alloc* alloc = nullptr;
     SchedulerThread<T>* next = nullptr;
     SchedulerThread<T>* victim = nullptr;
@@ -74,14 +73,6 @@ namespace verona::rt
     // process before reaching its LD checkpoint (`n_ld_tokens == 0`).
     uint8_t n_ld_tokens = 0;
 
-    // The cown queue is initialized with only the token (a cown) in.
-    // Whenever the token is popped out, `token_consumed` is set to `true`,
-    // informing its owner so that it could re-insert the token, which is
-    // required because there's always one cown stuck in the queue; if the
-    // token is not there, this must mean a real cown is stuck there.
-    // Accordingly, the `is_empty` returns true iff token is the only item
-    // left in the queue.
-    std::atomic<bool> token_consumed = false;
     bool should_steal_for_fairness = false;
 
     std::atomic<bool> scheduled_unscanned_cown = false;
@@ -142,11 +133,7 @@ namespace verona::rt
         scheduled_unscanned_cown = true;
       }
       assert(!a->queue.is_sleeping());
-      q.enqueue(alloc, a);
-
-      // Put the token back if it has been stolen.  This will help
-      // free up more work for other threads to steal.
-      check_token_cown();
+      q.enqueue(*alloc, a);
 
       if (Scheduler::get().unpause())
         stats.unpause();
@@ -168,35 +155,13 @@ namespace verona::rt
         stats.unpause();
     }
 
-    void check_token_cown()
-    {
-      if (is_token_consumed())
-      {
-        Systematic::cout() << "Put token " << get_token_cown()
-                           << " in scheduler queue." << Systematic::endl;
-        if (n_ld_tokens > 0)
-        {
-          dec_n_ld_tokens();
-        }
-        set_token_consumed(false);
-        enqueue_token();
-
-        if (Scheduler::get().fair)
-        {
-          Systematic::cout()
-            << "Should steal for fairness!" << Systematic::endl;
-          should_steal_for_fairness = true;
-        }
-      }
-    }
-
     /**
      * Track a cown muted on this thread so that it may be unmuted prior to
      * shutdown.
      */
     void mute_set_add(T* cown)
     {
-      bool inserted = mute_set.insert(alloc, cown).first;
+      bool inserted = mute_set.insert(*alloc, cown).first;
       if (inserted)
         cown->weak_acquire();
     }
@@ -212,9 +177,9 @@ namespace verona::rt
         // This operation should be safe if the cown has been collected but the
         // stub exists.
         entry.key()->backpressure_transition(Priority::Normal);
-        entry.key()->weak_release(alloc);
+        entry.key()->weak_release(*alloc);
       }
-      mute_set.clear(alloc);
+      mute_set.clear(*alloc);
     }
 
     template<typename... Args>
@@ -235,7 +200,7 @@ namespace verona::rt
       startup(args...);
 
       Scheduler::local() = this;
-      alloc = ThreadAlloc::get();
+      alloc = &ThreadAlloc::get();
       victim = next;
       T* cown = nullptr;
 
@@ -260,13 +225,12 @@ namespace verona::rt
           }
         }
 
-        check_token_cown();
-
         if (cown == nullptr)
         {
-          cown = q.dequeue(alloc);
+          cown = q.dequeue(*alloc);
           if (cown != nullptr)
-            Systematic::cout() << "Pop cown " << cown << Systematic::endl;
+            Systematic::cout()
+              << "Pop cown " << clear_thread_bit(cown) << Systematic::endl;
         }
 
         if (cown == nullptr)
@@ -305,7 +269,7 @@ namespace verona::rt
 
         Systematic::cout() << "Running cown " << cown << Systematic::endl;
 
-        bool reschedule = cown->run(alloc, state, send_epoch);
+        bool reschedule = cown->run(*alloc, state, send_epoch);
 
         if (reschedule)
         {
@@ -321,7 +285,7 @@ namespace verona::rt
             // otherwise run this cown again. Don't push to the queue
             // immediately to avoid another thread stealing our only cown.
 
-            T* n = q.dequeue(alloc);
+            T* n = q.dequeue(*alloc);
 
             if (n != nullptr)
             {
@@ -330,7 +294,7 @@ namespace verona::rt
             }
             else
             {
-              if (q.is_empty())
+              if (q.nothing_old())
               {
                 Systematic::cout() << "Queue empty" << Systematic::endl;
                 // We have effectively reached token cown.
@@ -370,7 +334,7 @@ namespace verona::rt
       while (cown != nullptr)
       {
         if (!cown->is_collected())
-          cown->collect(alloc);
+          cown->collect(*alloc);
         cown = cown->next;
       }
 
@@ -387,9 +351,13 @@ namespace verona::rt
 
       Systematic::cout() << "End teardown (phase 2)" << Systematic::endl;
 
-      q.destroy(alloc);
+      q.destroy(*alloc);
 
       Scheduler::get().sync.thread_finished(this);
+
+      // Reset the local thread pointer as this physical thread could be reused
+      // for a different SchedulerThread later.
+      Scheduler::local() = nullptr;
     }
 
     bool fast_steal(T*& result)
@@ -400,13 +368,14 @@ namespace verona::rt
       // Try to steal from the victim thread.
       if (victim != this)
       {
-        cown = victim->q.dequeue(alloc);
+        cown = victim->q.dequeue(*alloc);
 
         if (cown != nullptr)
         {
           // stats.steal();
-          Systematic::cout() << "Fast-steal cown " << cown << " from "
-                             << victim->systematic_id << Systematic::endl;
+          Systematic::cout()
+            << "Fast-steal cown " << clear_thread_bit(cown) << " from "
+            << victim->systematic_id << Systematic::endl;
           result = cown;
           return true;
         }
@@ -425,25 +394,6 @@ namespace verona::rt
       n_ld_tokens--;
     }
 
-    bool is_token_consumed()
-    {
-      auto res = token_consumed.load(std::memory_order_relaxed);
-      yield();
-      return res;
-    }
-
-    bool debug_is_token_consumed()
-    {
-      auto res = token_consumed.load(std::memory_order_relaxed);
-      return res;
-    }
-
-    void set_token_consumed(bool res)
-    {
-      yield();
-      token_consumed.store(res, std::memory_order_relaxed);
-    }
-
     T* steal()
     {
       uint64_t tsc = Aal::tick();
@@ -451,11 +401,9 @@ namespace verona::rt
 
       while (running)
       {
-        check_token_cown();
-
         yield();
 
-        if (q.is_empty())
+        if (q.nothing_old())
         {
           n_ld_tokens = 0;
         }
@@ -464,7 +412,7 @@ namespace verona::rt
         ld_protocol();
 
         // Check if some other thread has pushed work on our queue.
-        cown = q.dequeue(alloc);
+        cown = q.dequeue(*alloc);
 
         if (cown != nullptr)
           return cown;
@@ -472,13 +420,14 @@ namespace verona::rt
         // Try to steal from the victim thread.
         if (victim != this)
         {
-          cown = victim->q.dequeue(alloc);
+          cown = victim->q.dequeue(*alloc);
 
           if (cown != nullptr)
           {
             stats.steal();
-            Systematic::cout() << "Stole cown " << cown << " from "
-                               << victim->systematic_id << Systematic::endl;
+            Systematic::cout()
+              << "Stole cown " << clear_thread_bit(cown) << " from "
+              << victim->systematic_id << Systematic::endl;
             return cown;
           }
         }
@@ -486,39 +435,38 @@ namespace verona::rt
         // We were unable to steal, move to the next victim thread.
         victim = victim->next;
 
+#ifdef USE_SYSTEMATIC_TESTING
+        // Only try to pause with 1/(2^5) probability
+        UNUSED(tsc);
+        if (!Systematic::coin(5))
+        {
+          yield();
+          continue;
+        }
+#else
         // Wait until a minimum timeout has passed.
         uint64_t tsc2 = Aal::tick();
-
-#ifndef USE_SYSTEMATIC_TESTING
         if ((tsc2 - tsc) < TSC_QUIESCENCE_TIMEOUT)
         {
           Aal::pause();
-        }
-        else
-#else
-        {
-          UNUSED(tsc);
+          continue;
         }
 #endif
-          if (mute_set.size() != 0)
+
+        if (mute_set.size() != 0)
         {
           mute_set_clear();
           continue;
         }
-        // Enter sleep only when the queue doesn't contain any real cowns.
-        else if (state == ThreadState::NotInLD && q.is_empty())
+
+        // Enter sleep only if we aren't executing the leak detector currently.
+        if (state == ThreadState::NotInLD)
         {
           // We've been spinning looking for work for some time. While paused,
           // our running flag may be set to false, in which case we terminate.
-          if (Scheduler::get().pause(tsc2))
+          if (Scheduler::get().pause())
             stats.pause();
         }
-#ifdef USE_SYSTEMATIC_TESTING
-        else
-        {
-          yield();
-        }
-#endif
       }
 
       return nullptr;
@@ -544,25 +492,37 @@ namespace verona::rt
      **/
     bool prerun(T* cown)
     {
-      // See if this is a SchedulerThread enqueued as an cown LD marker.
+      // See if this is a SchedulerThread enqueued as a cown LD marker.
       // It may not be this one.
       if (has_thread_bit(cown))
       {
         auto unmasked = clear_thread_bit(cown);
         SchedulerThread* sched = unmasked->owning_thread();
-        assert(!sched->debug_is_token_consumed());
-        sched->set_token_consumed(true);
 
-        if (sched != this)
+        if (sched == this)
+        {
+          if (Scheduler::get().fair)
+          {
+            Systematic::cout()
+              << "Should steal for fairness!" << Systematic::endl;
+            should_steal_for_fairness = true;
+          }
+
+          if (n_ld_tokens > 0)
+          {
+            dec_n_ld_tokens();
+          }
+
+          Systematic::cout() << "Reached token" << Systematic::endl;
+        }
+        else
         {
           Systematic::cout() << "Reached token: stolen from "
                              << sched->systematic_id << Systematic::endl;
         }
-        else
-        {
-          Systematic::cout() << "Reached token" << Systematic::endl;
-        }
 
+        // Put back the token
+        sched->q.enqueue(*alloc, cown);
         return false;
       }
 
@@ -738,13 +698,6 @@ namespace verona::rt
                          << Systematic::endl;
     }
 
-    void enqueue_token()
-    {
-      // Must set the flag before pushing due to work stealing.
-      assert(!debug_is_token_consumed());
-      q.enqueue(alloc, (T*)((uintptr_t)get_token_cown() | 1));
-    }
-
     void enter_scan()
     {
       send_epoch = (prev_epoch == EpochMark::EPOCH_B) ? EpochMark::EPOCH_A :
@@ -777,7 +730,7 @@ namespace verona::rt
       while (p != nullptr)
       {
         T* n = p->next;
-        p->try_collect(alloc, send_epoch);
+        p->try_collect(*alloc, send_epoch);
         p = n;
       }
     }
@@ -827,7 +780,7 @@ namespace verona::rt
             *p = c->next;
             Systematic::cout()
               << "Stub collected cown " << c << Systematic::endl;
-            c->dealloc(alloc);
+            c->dealloc(*alloc);
             continue;
           }
           else

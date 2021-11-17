@@ -21,6 +21,22 @@ if (ENABLE_ASSERTS)
   enable_asserts()
 endif()
 
+# Sanitizers must be added first, or it gets upset.
+if(SANITIZER)
+  if(MSVC)
+    message(FATAL_ERROR "MSVC does not support sanitizers")
+  endif()
+  message(STATUS "Using sanitizer=${SANITIZER}")
+  add_compile_options(-fsanitize=${SANITIZER})
+  add_link_options(-fsanitize=${SANITIZER})
+  # Disable vptr check in UBSAN (incompatible with -no-rtti used by LLVM)
+  # https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#available-checks
+  if (SANITIZER MATCHES "undefined")
+    add_compile_options(-fno-sanitize=vptr)
+    add_link_options(-fno-sanitize=vptr)
+  endif()
+endif()
+
 add_subdirectory(../external/CLI11 ./external/CLI11 EXCLUDE_FROM_ALL)
 add_subdirectory(../external/fmt ./external/fmt EXCLUDE_FROM_ALL)
 add_subdirectory(../external/pegmatite ./external/pegmatite EXCLUDE_FROM_ALL)
@@ -51,8 +67,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 endif()
 
 add_subdirectory(parser)
-add_subdirectory(compiler)
-add_subdirectory(interpreter)
+add_subdirectory(deprecated)
 add_subdirectory(mlir)
 add_subdirectory(interop)
 
