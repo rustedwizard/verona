@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include <snmalloc.h>
+#include <snmalloc/snmalloc.h>
 
 namespace verona::rt
 {
@@ -108,15 +108,12 @@ namespace verona::rt
     };
 
   private:
-    State state;
-    bool retracted;
-    std::atomic<size_t> vote_yes;
+    State state{NotInLD};
+    bool retracted{false};
+    std::atomic<size_t> vote_yes{0};
 
   public:
-    ThreadState()
-    {
-      reset<NotInLD>();
-    }
+    constexpr ThreadState() = default;
 
     State get_state()
     {

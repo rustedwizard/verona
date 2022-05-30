@@ -2,649 +2,318 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#ifdef _MSC_VER
-#  include <DbgHelp.h>
-#  include <windows.h>
-#  pragma comment(lib, "dbghelp.lib")
-#elif defined(USE_EXECINFO)
-#  include "threadping.h"
+#include "../pal/semaphore.h"
+#include "ds/scramble.h"
+#include "test/xoroshiro.h"
 
-#  include <condition_variable>
-#  include <csignal>
-#  include <cxxabi.h>
-#  include <execinfo.h>
-#  include <thread>
-#endif
-
-#include "../ds/asymlock.h"
-#include "ds/morebits.h"
-#ifdef USE_SYSTEMATIC_TESTING
-#  include "ds/scramble.h"
-#  include "test/xoroshiro.h"
-#endif
-
-#include <iomanip>
-#include <iostream>
-#include <snmalloc.h>
-#include <sstream>
-
-namespace Systematic
+namespace verona::rt
 {
-#ifdef USE_SYSTEMATIC_TESTING
-  /// Return a mutable reference to the pseudo random number generator (PRNG).
-  /// It is assumed that the PRNG will only be setup once via `set_seed`. After
-  /// it is setup, the PRNG must only be used via `get_prng_next`.
-  static inline xoroshiro::p128r32& get_prng_for_setup()
+  class Systematic
   {
-    static xoroshiro::p128r32 prng;
-    return prng;
-  }
-
-  /// Return the next pseudo random number.
-  static inline uint32_t get_prng_next()
-  {
-    auto& prng = get_prng_for_setup();
-    static std::atomic_flag lock;
-    snmalloc::FlagLock l{lock};
-    return prng.next();
-  }
-
-  /// Return a mutable reference to the scrambler. It is assumed that the
-  /// scrambler will only be setup once via `set_seed`. After it is setup, the
-  /// scrambler must only be accessed via a const reference
-  /// (see `get_scrambler`).
-  static inline verona::Scramble& get_scrambler_for_setup()
-  {
-    static verona::Scramble scrambler;
-    return scrambler;
-  }
-
-  /// Return a const reference to the scrambler.
-  static inline const verona::Scramble& get_scrambler()
-  {
-    return get_scrambler_for_setup();
-  }
-
-  static inline void set_seed(uint64_t seed)
-  {
-    auto& rng = get_prng_for_setup();
-    rng.set_state(seed);
-    get_scrambler_for_setup().setup(rng);
-  }
-
-  /// 1/(2^range_bits) likelyhood of returning true
-  static inline bool coin(size_t range_bits = 1)
-  {
-    assert(range_bits < 20);
-    return (get_prng_next() & ((1ULL << range_bits) - 1)) == 0;
-  }
-#endif
+    enum class SystematicState
+    {
+      Active,
+      Finished
+    };
 
 #ifdef USE_SYSTEMATIC_TESTING
-  static constexpr bool systematic = true;
+    static constexpr bool enabled = true;
 #else
-  static constexpr bool systematic = false;
-#endif
-
-#ifdef USE_FLIGHT_RECORDER
-  static constexpr bool flight_recorder = true;
-#else
-  static constexpr bool flight_recorder = false;
-#endif
-
-  struct Header
-  {
-    size_t time;
-    size_t items;
-  };
-
-  struct Item
-  {
-    size_t value;
-    std::ostream& (*pp)(std::ostream&, size_t const&);
-  };
-
-  union Entry
-  {
-    Header header;
-    Item item;
-  };
-
-  // Filled in later by the scheduler thread
-  std::string get_systematic_id();
-
-  class LocalLog : public snmalloc::Pooled<LocalLog>
-  {
-  private:
-    friend class ThreadLocalLog;
-    friend class SysLog;
-
-#ifdef USE_FLIGHT_RECORDER
-    static constexpr size_t size =
-      (1 << 18) - 3 - (sizeof(verona::rt::AsymmetricLock) / 8);
-#else
-    static constexpr size_t size = 1;
-#endif
-    size_t index;
-    size_t working_index;
-    std::string systematic_id = "";
-    verona::rt::AsymmetricLock alock;
-
-    Entry log[size];
-
-  public:
-    LocalLog()
-    {
-      if constexpr (flight_recorder)
-      {
-        reset();
-      }
-    }
-
-  private:
-    static size_t get_start()
-    {
-      static size_t start = snmalloc::Aal::tick();
-      return start;
-    }
-
-    void add(size_t pp, size_t val)
-    {
-      alock.internal_acquire();
-      working_index = verona::rt::bits::inc_mod(working_index, size);
-      log[working_index].header.time = val;
-      log[working_index].header.items = pp;
-      alock.internal_release();
-    }
-
-    void eject()
-    {
-      alock.internal_acquire();
-      systematic_id = get_systematic_id();
-      working_index = verona::rt::bits::inc_mod(working_index, size);
-      log[working_index].header.time = snmalloc::Aal::tick() - get_start();
-      log[working_index].header.items = (working_index - index + size) % size;
-      index = working_index;
-      alock.internal_release();
-    }
-
-    void suspend_logging(bool external)
-    {
-      if (external)
-        alock.external_acquire();
-
-      working_index = size - 1;
-    }
-
-    void resume_logging(bool external)
-    {
-      if (external)
-        alock.external_release();
-
-      reset();
-    }
-
-    void reset()
-    {
-      log[0].header.time = 0;
-      log[0].header.items = 0;
-      index = 0;
-      working_index = 0;
-    }
-
-    bool peek_time(size_t& time)
-    {
-      auto entry_size = log[index % size].header.items;
-
-      if (entry_size == 0)
-        return false;
-
-      if (working_index <= entry_size)
-        return false;
-
-      time = log[index % size].header.time;
-      return true;
-    }
-
-    void pop_and_print(std::ostream& o)
-    {
-      size_t time;
-      assert(peek_time(time));
-
-      size_t entry_size = log[index % size].header.items;
-
-      time = log[index % size].header.time;
-
-      o << systematic_id;
-
-      index = (index - entry_size + size) % size;
-      working_index = working_index - entry_size;
-
-      for (size_t n = 1; n < entry_size; n++)
-      {
-        auto pp = log[(index + n) % size].item.pp;
-        size_t value = log[(index + n) % size].item.value;
-        (*pp)(o, value);
-      }
-
-      o << " (" << time << ")" << std::endl;
-    }
-  };
-
-  using LocalLogPool = snmalloc::Pool<LocalLog, snmalloc::Alloc::StateHandle>;
-
-  class ThreadLocalLog
-  {
-  private:
-    friend class SysLog;
-
-    LocalLog* log = nullptr;
-#ifdef USE_FLIGHT_RECORDER
-    ThreadLocalLog() : log(LocalLogPool::acquire()) {}
-
-    ~ThreadLocalLog()
-    {
-      LocalLogPool::release(log);
-    }
+    static constexpr bool enabled = false;
 #endif
 
   public:
-    static ThreadLocalLog& get()
+    /**
+     * Per thread state required for systematic testing.
+     */
+    class Local
     {
-      static thread_local ThreadLocalLog mine;
-      return mine;
-    }
+      friend Systematic;
+      /// Used by systematic testing to implement the condition variable,
+      /// and thread termination.
+      SystematicState systematic_state = SystematicState::Active;
 
-    static void dump(std::ostream& o)
-    {
-      if constexpr (flight_recorder)
-      {
-        o << "Crash log begins with most recent events" << std::endl;
+      /// Used to specify a condition when this thread should/could make
+      /// progress.  It is used to implement condition variables.
+      snmalloc::function_ref<bool()> guard = true_thunk;
 
-        o << "THIS IS BACKWARDS COMPARED TO THE NORMAL LOG!" << std::endl;
+      /// How many uninterrupted steps this threads has been selected to run
+      /// for.
+      size_t steps = 0;
 
-        // Set up all logs for dumping
-        auto curr = LocalLogPool::iterate();
-        auto mine = get().log;
+      /// Alters distribution of steps taken in systematic testing.
+      size_t systematic_speed_mask = 1;
 
-        while (curr != nullptr)
-        {
-          curr->suspend_logging(curr != mine);
-          curr = LocalLogPool::iterate(curr);
-        }
+      /// Used for debugging.
+      size_t systematic_id;
 
-        LocalLog* next = nullptr;
-        while (true)
-        {
-          next = nullptr;
-          size_t t1 = 0;
-          curr = LocalLogPool::iterate();
+      /// Used to sleep and wake the threads systematically.
+      pal::SleepHandle sh;
 
-          while (curr != nullptr)
-          {
-            size_t t2;
-            if (curr->peek_time(t2))
-            {
-              if (next == nullptr || t1 < t2)
-              {
-                next = curr;
-                t1 = t2;
-              }
-            }
-            curr = LocalLogPool::iterate(curr);
-          }
+      // Pointer to cyclic list of threads structures.
+      Local* next = nullptr;
 
-          if (next == nullptr)
-            break;
+      Local(size_t id) : systematic_id(id) {}
+    };
 
-          next->pop_and_print(o);
-        }
+    static inline snmalloc::function_ref<bool()> true_thunk{
+      []() { return true; }};
 
-        curr = LocalLogPool::iterate();
-        while (curr != nullptr)
-        {
-          curr->resume_logging(curr != mine);
-          curr = LocalLogPool::iterate(curr);
-        }
-
-        o.flush();
-      }
-    }
-  };
-
-  template<typename T>
-  static std::ostream& pretty_printer(std::ostream& os, T const& e)
-  {
-    return os << e;
-  }
-  class SysLog
-  {
   private:
-    std::ostream* o;
-    bool first;
+    /// Currently running thread.  Points to a cyclic list of all the threads.
+    static inline Local* running_thread{nullptr};
 
-    static std::stringstream& get_ss()
+    /// Contains thread local state primarily for sleeping and waking a thread.
+    static inline thread_local Local* local_systematic{nullptr};
+
+    /// How many threads have been added to this systematic testing run.
+    static inline size_t num_threads{0};
+
+    /// How many threads have terminated in this test run.
+    static inline size_t finished_threads{0};
+
+    /// If true, then systematic testing has enabled a thread.
+    static inline bool running{false};
+
+    /// Return a mutable reference to the pseudo random number generator (PRNG).
+    /// It is assumed that the PRNG will only be setup once via `set_seed`.
+    /// After it is setup, the PRNG must only be used via `get_prng_next`.
+    static xoroshiro::p128r32& get_prng_for_setup()
     {
-      static thread_local std::stringstream ss;
-      return ss;
+      static xoroshiro::p128r32 prng;
+      return prng;
     }
 
-    inline static bool& get_logging()
+    /// Return a mutable reference to the scrambler. It is assumed that the
+    /// scrambler will only be setup once via `set_seed`. After it is setup, the
+    /// scrambler must only be accessed via a const reference
+    /// (see `get_scrambler`).
+    static verona::Scramble& get_scrambler_for_setup()
     {
-      static bool logging = false;
-      return logging;
-    }
-
-    template<typename T>
-    inline SysLog& inner_cons(const T& value)
-    {
-      static_assert(sizeof(T) <= sizeof(size_t));
-
-      if constexpr (systematic)
-      {
-        if (get_logging())
-        {
-          if (first)
-          {
-            get_ss() << get_systematic_id();
-            first = false;
-          }
-
-          get_ss() << value;
-        }
-      }
-
-      if constexpr (flight_recorder)
-      {
-        std::ostream& (*pp)(std::ostream & os, T const& e) = &(pretty_printer);
-
-        size_t flat_value = (size_t)value;
-
-        LocalLog* log = ThreadLocalLog::get().log;
-        log->add((size_t)pp, (size_t)flat_value);
-      }
-
-      return *this;
+      static verona::Scramble scrambler;
+      return scrambler;
     }
 
   public:
-#ifdef USE_SYSTEMATIC_TESTING
-    SysLog()
+    /// Return the next pseudo random number.
+    static uint32_t get_prng_next()
     {
-      if constexpr (systematic)
+      auto& prng = get_prng_for_setup();
+      static snmalloc::FlagWord lock;
+      snmalloc::FlagLock l{lock};
+      return prng.next();
+    }
+
+    /// Return a const reference to the scrambler.
+    static const verona::Scramble& get_scrambler()
+    {
+      return get_scrambler_for_setup();
+    }
+
+    static void set_seed(uint64_t seed)
+    {
+      auto& rng = get_prng_for_setup();
+      rng.set_state(seed);
+      get_scrambler_for_setup().setup(rng);
+    }
+
+    /// 1/(2^range_bits) likelyhood of returning true
+    static bool coin(size_t range_bits = 1)
+    {
+      assert(range_bits < 20);
+      return (get_prng_next() & ((1ULL << range_bits) - 1)) == 0;
+    }
+
+  private:
+    /**
+     * Internal function for selecting the next thread to run.
+     *
+     * startup is true if this is part of starting the sys-testing
+     * runtime.
+     */
+    static void choose_next(bool startup = false)
+    {
+      auto r = get_prng_next();
+      auto i = snmalloc::bits::ctz(r != 0 ? r : 1);
+      auto start = running_thread;
+
+      assert((running_thread == local_systematic) || startup);
+      snmalloc::UNUSED(startup);
+
+      // Skip to a first choice for selecting.
+      for (; i > 0; i--)
+        start = start->next;
+
+      auto curr = start;
+      while ((curr->systematic_state != SystematicState::Active) ||
+             !curr->guard())
       {
-        o = &std::cout;
-        first = true;
-      }
-    }
-#endif
-
-    static void dump_flight_recorder(std::string id = "")
-    {
-      static std::atomic_flag dump_in_progress = ATOMIC_FLAG_INIT;
-
-      snmalloc::FlagLock f(dump_in_progress);
-
-      if constexpr (flight_recorder)
-      {
-        std::cerr << "Dump started by " << (id != "" ? id : get_systematic_id())
-                  << std::endl;
-        ThreadLocalLog::dump(std::cerr);
-        std::cerr << "Dump complete!" << std::endl;
-      }
-    }
-
-    inline SysLog& operator<<(const char* value)
-    {
-      return inner_cons(value);
-    }
-
-    inline SysLog& operator<<(const void* value)
-    {
-      return inner_cons(value);
-    }
-
-    template<typename T>
-    inline SysLog& operator<<(const T& value)
-    {
-      static_assert(sizeof(T) <= sizeof(size_t));
-      return inner_cons(value);
-    }
-
-    inline SysLog& operator<<(std::ostream& (*f)(std::ostream&))
-    {
-      if constexpr (systematic)
-      {
-        if (get_logging())
+        curr = curr->next;
+        if (curr == start)
         {
-          get_ss() << f;
-          *o << get_ss().str();
-          get_ss().str(""); // Clear the stream
-          o->flush();
-          first = true;
+          Logging::cout() << "All threads sleeping!" << Logging::endl;
+          abort();
         }
       }
-      if constexpr (flight_recorder)
+
+      Logging::cout() << "Set running thread:" << curr->systematic_id
+                      << Logging::endl;
+      assert(curr->guard());
+
+      running_thread = curr;
+      assert(curr->systematic_state == SystematicState::Active);
+      curr->steps = get_prng_next() & curr->systematic_speed_mask;
+      curr->sh.wake();
+    }
+
+  public:
+    /**
+     * Creates the structure for pausing a thread in systematic testing.  This
+     * should be called in a sequential setting so that determinism is
+     * maintained.
+     */
+    static Local* create_systematic_thread(size_t id)
+    {
+      if constexpr (enabled)
       {
-        ThreadLocalLog::get().log->eject();
-      }
-      return *this;
-    }
+        assert((!running) || (running_thread == local_systematic));
 
-    inline static void enable_logging()
-    {
-      get_logging() = true;
-    }
-  };
-
-#if defined(CI_BUILD) && defined(_MSC_VER)
-  inline LONG ExceptionHandler(_EXCEPTION_POINTERS* ExceptionInfo)
-  {
-    // On any exception dump the flight recorder
-    // TODO:  Out of memory filtering
-    // TODO:  Handle crashes in the dump method.
-    // TODO:  Hold other threads here until this one is finished.
-    // TODO:  Possibly add stack tracing to the dump
-    // TODO:  Cross platform
-    // TODO:  Check it is a runtime thread
-    (void)ExceptionInfo;
-
-    DWORD error;
-    HANDLE hProcess = GetCurrentProcess();
-
-    char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)];
-    PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)buffer;
-
-    pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
-    pSymbol->MaxNameLen = MAX_SYM_NAME;
-
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-
-    if (!SymInitialize(hProcess, NULL, TRUE))
-    {
-      // SymInitialize failed
-      error = GetLastError();
-      printf("SymInitialize returned error : %d\n", error);
-      return FALSE;
-    }
-
-    void* stack[1024];
-    DWORD count = CaptureStackBackTrace(0, 1024, stack, NULL);
-    IMAGEHLP_LINE64 line;
-    line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
-
-    for (int i = 0; count > 0; count--, i++)
-    {
-      DWORD64 dwDisplacement = 0;
-      DWORD64 dwAddress = (DWORD64)stack[i];
-
-      if (SymFromAddr(hProcess, dwAddress, &dwDisplacement, pSymbol))
-      {
-        DWORD dwDisplacement2 = 0;
-        if (SymGetLineFromAddr64(hProcess, dwAddress, &dwDisplacement2, &line))
+        auto l = new Local(id);
+        if (running_thread == nullptr)
         {
-          std::cerr << "Frame: " << pSymbol->Name << " (" << line.FileName
-                    << ": " << line.LineNumber << ")" << std::endl;
+          // First thread. Create single element cyclic list.
+          l->next = l;
+          running_thread = l;
         }
         else
         {
-          std::cerr << "Frame: " << pSymbol->Name << std::endl;
+          // Insert into the cyclic list.
+          l->next = running_thread->next;
+          running_thread->next = l;
         }
+        l->systematic_speed_mask = (8ULL << (get_prng_next() % 4)) - 1;
+
+        num_threads++;
+        return l;
       }
       else
       {
-        error = GetLastError();
-        std::cerr << "SymFromAddr returned error : " << error << std::endl;
+        snmalloc::UNUSED(id);
+        return nullptr;
       }
     }
 
-    SysLog::dump_flight_recorder();
-
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
-
-#elif defined(CI_BUILD) && defined(USE_EXECINFO)
-  static void* stack_frames = nullptr;
-  static int n_frames = 0;
-  static std::string systematic_id = "";
-
-  inline static void crash_dump()
-  {
-    // This can't happen as this is only in response to a ping,
-    // but GCC complains, and this is not fast path, so additional
-    // check is not a problem.
-    if (stack_frames == nullptr)
-      abort();
-
-    // Stop handling abort signals.
-    auto* sa = new struct sigaction;
-    sa->sa_handler = SIG_DFL;
-    sigaction(SIGABRT, sa, nullptr);
-    sigaction(SIGINT, sa, nullptr);
-
-    // Attempt to print stack trace
-    auto syms = backtrace_symbols((void* const*)stack_frames, n_frames);
-    if (syms != nullptr)
+    /**
+     * Attach this thread to the systematic testing implementation.
+     *
+     * Must be passed a pointer return from `create_systematic_thread`.
+     */
+    static void attach_systematic_thread(Local* l)
     {
-      constexpr size_t buf_size = 1024;
-      char buf[buf_size];
-      auto demangle_buf = static_cast<char*>(malloc(sizeof(char) * buf_size));
-      for (auto i = 2; i < n_frames; i++)
+      if constexpr (enabled)
       {
-        auto* sym = syms[i];
-#  ifdef __APPLE__
-        // macOS symbol format: index  module   address function + offset
-        auto* mangled_end = strrchr(sym, '+') - 1;
-        *mangled_end = 0;
-        auto* mangled_begin = strrchr(sym, ' ') + 1;
-        *mangled_end = ' ';
-#  else
-        // symbol format: module(function+offset) [address]
-        auto* mangled_begin = strchr(sym, '(') + 1;
-        auto* mangled_end = strchr(sym, '+');
-#  endif
-        auto* sym_end = sym + strlen(sym);
-        if (
-          (mangled_begin < sym) || (mangled_end > sym_end) ||
-          (mangled_end <= mangled_begin))
+        local_systematic = l;
+        l->sh.sleep();
+      }
+      else
+      {
+        snmalloc::UNUSED(l);
+      }
+    }
+
+    /**
+     * Switches thread in systematic testing and only returns once
+     * guard evaluates to true.
+     */
+    static void yield_until(snmalloc::function_ref<bool()> guard)
+    {
+      if constexpr (enabled)
+      {
+        if (!running)
         {
-          std::cerr << sym << std::endl;
-          continue;
+          if (!guard())
+            abort();
+          return;
         }
-        size_t mangled_len = (size_t)(mangled_end - mangled_begin);
-        strncpy(buf, mangled_begin, mangled_len);
-        buf[mangled_len] = 0;
-        auto err = 0;
-        auto size = buf_size;
-        char* demangled = abi::__cxa_demangle(buf, demangle_buf, &size, &err);
-        if (!err)
+
+        assert(local_systematic != nullptr);
+
+        if (local_systematic->steps > 0 && guard())
         {
-          std::cerr.write(sym, mangled_begin - sym);
-          std::cerr << demangled << mangled_end << std::endl;
+          local_systematic->steps--;
+          return;
+        }
+
+        local_systematic->guard = guard;
+
+        choose_next();
+
+        local_systematic->sh.sleep();
+      }
+      else
+      {
+        snmalloc::UNUSED(guard);
+      }
+    }
+
+    /**
+     * Switches thread in systematic testing.
+     */
+    static void yield()
+    {
+      yield_until(true_thunk);
+    }
+
+    /**
+     * Call this when the thread has completed.
+     */
+    static void finished_thread()
+    {
+      if constexpr (enabled)
+      {
+        finished_threads++;
+
+        if (finished_threads < num_threads)
+        {
+          local_systematic->systematic_state = SystematicState::Finished;
+          choose_next();
+          local_systematic->sh.sleep();
         }
         else
         {
-          std::cerr << sym << std::endl;
+          // All threads have finished.
+          auto curr = running_thread;
+          running = false;
+          Logging::cout() << "All threads finished!" << Logging::endl;
+          do
+          {
+            auto next = curr->next;
+            Logging::cout() << "Thread " << curr->systematic_id << " finished."
+                            << Logging::endl;
+            curr->sh.wake();
+            curr = next;
+          } while (curr != running_thread);
+
+          running_thread = nullptr;
+          num_threads = 0;
+          finished_threads = 0;
         }
+
+        delete local_systematic;
+        local_systematic = nullptr;
       }
     }
-    SysLog::dump_flight_recorder(systematic_id);
-    abort();
-  }
 
-  /// Encapsulates thread that handles crash dump
-  static verona::rt::ThreadPing crash_thread{&crash_dump};
-
-  inline static void signal_handler(int sig, siginfo_t*, void*)
-  {
-    static std::atomic_flag run_already{};
-
-    constexpr size_t max_stack_frames = 64;
-    void* frames[max_stack_frames];
-
-    // Ignore subsequent calls.
-    if (!run_already.test_and_set())
+    /**
+     * Call this to start threads running in systematic testing.
+     */
+    static void start()
     {
-      auto str = strsignal(sig);
-
-      // We're ignoring the result of write, as there's not much we can do if it
-      // fails. We're about to crash anyway.
-      auto s1 = write(1, str, strlen(str));
-      auto s2 = write(1, "\n", 1);
-      UNUSED(s1 + s2);
-
-      // Set up data for the crash dump
-      n_frames = backtrace(frames, max_stack_frames);
-      stack_frames = frames;
-      systematic_id = get_systematic_id();
-
-      // Nudge crash dump thread to output data.
-      crash_thread.ping();
-
-      // Need to not return so frames[max_stack_frames] still exists.
-      while (true)
+      if constexpr (enabled)
       {
-        sleep(1000);
+        running = true;
+        choose_next(true);
       }
     }
-  }
-#endif
-
-  inline static void enable_crash_logging()
-  {
-#if defined(CI_BUILD) && defined(_MSC_VER)
-    AddVectoredExceptionHandler(0, &ExceptionHandler);
-#elif defined(CI_BUILD) && defined(USE_EXECINFO)
-    static struct sigaction sa;
-    sa.sa_sigaction = signal_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGILL, &sa, nullptr);
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGSYS, &sa, nullptr);
-#endif
-  }
-
-  inline static void enable_logging()
-  {
-    SysLog::enable_logging();
-  }
-
-  inline SysLog& cout()
-  {
-    static SysLog cout_log;
-    return cout_log;
-  }
-
-  inline std::ostream& endl(std::ostream& os)
-  {
-    if constexpr (systematic || flight_recorder)
-    {
-      os << std::endl;
-    }
-
-    return os;
-  }
-} // namespace Systematic
+  };
+} // namespace verona::rt

@@ -6,7 +6,7 @@
 #include "../object/object.h"
 #include "behaviour.h"
 
-#include <snmalloc.h>
+#include <snmalloc/snmalloc.h>
 
 namespace verona::rt
 {
@@ -19,6 +19,7 @@ namespace verona::rt
       size_t index;
       size_t count;
       Cown** cowns;
+      std::atomic<size_t> exec_count_down;
       Behaviour* behaviour;
     };
 
@@ -59,8 +60,8 @@ namespace verona::rt
         (e == EpochMark::EPOCH_NONE) || (e == EpochMark::EPOCH_A) ||
         (e == EpochMark::EPOCH_B));
 
-      Systematic::cout() << "MultiMessage epoch: " << this << " " << get_epoch()
-                         << " -> " << e << Systematic::endl;
+      Logging::cout() << "MultiMessage epoch: " << this << " " << get_epoch()
+                      << " -> " << e << Logging::endl;
 
       body = (MultiMessageBody*)((uintptr_t)get_body() | (size_t)e);
 
@@ -71,15 +72,15 @@ namespace verona::rt
     make_body(Alloc& alloc, size_t count, Cown** cowns, Behaviour* behaviour)
     {
       return new (alloc.alloc<sizeof(MultiMessageBody)>())
-        MultiMessageBody{0, count, cowns, behaviour};
+        MultiMessageBody{0, count, cowns, count, behaviour};
     }
 
     static MultiMessage*
     make_message(Alloc& alloc, MultiMessageBody* body, EpochMark epoch)
     {
       MultiMessage* m = make(alloc, epoch, body);
-      Systematic::cout() << "MultiMessage " << m << " payload " << body << " ("
-                         << epoch << ")" << Systematic::endl;
+      Logging::cout() << "MultiMessage " << m << " payload " << body << " ("
+                      << epoch << ")" << Logging::endl;
       return m;
     }
 

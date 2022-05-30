@@ -67,7 +67,7 @@ namespace verona::rt
     size_t current_memory_used = 0;
 
     // Compact representation of previous memory used as a sizeclass.
-    snmalloc::sizeclass_t previous_memory_used = 0;
+    snmalloc::sizeclass_t previous_memory_used;
 
     // Stack of stack based entry points into the region.
     StackThin<Object, Alloc> additional_entry_points{};
@@ -238,7 +238,7 @@ namespace verona::rt
      **/
     static void gc(Alloc& alloc, Object* o)
     {
-      Systematic::cout() << "Region GC called for: " << o << Systematic::endl;
+      Logging::cout() << "Region GC called for: " << o << Logging::endl;
       assert(o->debug_is_iso());
       assert(is_trace_region(o->get_region()));
 
@@ -248,7 +248,7 @@ namespace verona::rt
 
       // Copy additional roots into f.
       reg->additional_entry_points.forall([&f](Object* o) {
-        Systematic::cout() << "Additional root: " << o << Systematic::endl;
+        Logging::cout() << "Additional root: " << o << Logging::endl;
         f.push(o);
       });
 
@@ -261,8 +261,8 @@ namespace verona::rt
       {
         o = collect.pop();
         assert(o->debug_is_iso());
-        Systematic::cout() << "Region GC: releasing unreachable subregion: "
-                           << o << Systematic::endl;
+        Logging::cout() << "Region GC: releasing unreachable subregion: " << o
+                        << Logging::endl;
 
         // Note that we need to dispatch because `r` is a different region
         // metadata object.
@@ -349,9 +349,9 @@ namespace verona::rt
       // Update memory usage.
       current_memory_used += other->current_memory_used;
 
-      previous_memory_used = size_to_sizeclass(
-        sizeclass_to_size(other->previous_memory_used) +
-        sizeclass_to_size(other->previous_memory_used));
+      previous_memory_used = size_to_sizeclass_full(
+        sizeclass_full_to_size(other->previous_memory_used) +
+        sizeclass_full_to_size(other->previous_memory_used));
     }
 
     void swap_root_internal(Object* oroot, Object* nroot)
@@ -411,7 +411,7 @@ namespace verona::rt
             break;
 
           case Object::UNMARKED:
-            Systematic::cout() << "Mark" << p << Systematic::endl;
+            Logging::cout() << "Mark" << p << Logging::endl;
             p->mark();
             p->trace(dfs);
             break;
@@ -460,7 +460,7 @@ namespace verona::rt
       sweep_ring<TrivialRing, sweep_all>(alloc, o, primary_ring, collect);
 
       RememberedSet::sweep(alloc);
-      previous_memory_used = size_to_sizeclass(current_memory_used);
+      previous_memory_used = size_to_sizeclass_full(current_memory_used);
     }
 
     /**
@@ -554,7 +554,7 @@ namespace verona::rt
           case Object::UNMARKED:
           {
             Object* q = p->get_next();
-            Systematic::cout() << "Sweep " << p << Systematic::endl;
+            Logging::cout() << "Sweep " << p << Logging::endl;
             sweep_object<ring>(alloc, p, o, &gc, collect);
 
             if (ring != primary_ring && prev == this)
@@ -604,16 +604,14 @@ namespace verona::rt
       // It is an error if this region has additional roots.
       if (!additional_entry_points.empty())
       {
-        Systematic::cout() << "Region release failed due to additional roots"
-                           << Systematic::endl;
-        additional_entry_points.forall([](Object* o) {
-          Systematic::cout() << " root" << o << Systematic::endl;
-        });
+        Logging::cout() << "Region release failed due to additional roots"
+                        << Logging::endl;
+        additional_entry_points.forall(
+          [](Object* o) { Logging::cout() << " root" << o << Logging::endl; });
         abort();
       }
 
-      Systematic::cout() << "Region release: trace region: " << o
-                         << Systematic::endl;
+      Logging::cout() << "Region release: trace region: " << o << Logging::endl;
 
       // Sweep everything, including the entrypoint.
       sweep<SweepAll::Yes>(alloc, o, collect);

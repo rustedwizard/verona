@@ -32,7 +32,7 @@ namespace verona::interpreter
   instantiate(size_t cores, const Code& code, bool verbose, size_t seed = 1234)
   {
 #ifdef USE_SYSTEMATIC_TESTING
-    Systematic::set_seed(seed);
+    verona::rt::Systematic::set_seed(seed);
 #endif
     rt::Scheduler& sched = rt::Scheduler::get();
     sched.init(cores);
@@ -64,7 +64,7 @@ namespace verona::interpreter
     if (options.run_seed.has_value())
     {
       if (options.debug_runtime)
-        Systematic::enable_logging();
+        Logging::enable_logging();
       if (options.run_seed_upper.has_value())
       {
         for (size_t i = options.run_seed.value();

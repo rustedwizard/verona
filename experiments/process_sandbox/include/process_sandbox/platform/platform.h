@@ -6,7 +6,7 @@
  * platform-specific.
  */
 
-#include <pal/pal.h>
+#include <snmalloc/pal/pal.h>
 #ifdef __unix__
 #  include <fcntl.h>
 #endif
@@ -141,7 +141,7 @@ namespace sandbox
 #else
 #  error Handle type not defined for your platform
 #endif
-    void disable_aslr()
+    inline void disable_aslr()
     {
 #ifdef __linux__
       int p = personality(0xffffffff);
