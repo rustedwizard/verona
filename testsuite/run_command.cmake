@@ -8,11 +8,12 @@ make_directory(${OUTPUT_DIR})
 
 include(${CMAKE_CURRENT_LIST_DIR}/${TOOLNAME}.cmake)
 
-toolargs(TOOLARGS ${TESTFILE} ${OUTPUT_DIR})
+message("Verona Local dist: ${VERONA_LOCAL_DIST}")
+toolinvoke(TOOLINVOKE ${VERONA_LOCAL_DIST} ${TESTFILE} ${OUTPUT_DIR})
 
-list(JOIN TOOLARGS " " TOOLARGS_SEP)
+list(JOIN TOOLINVOKE " " TOOLINVOKE_SEP)
 message ("Running")
-message ("   ${TOOLCMD} " ${TOOLARGS_SEP})
+message ("   ${TOOLINVOKE_SEP}")
 message ("in working directory")
 message ("   ${WORKING_DIR}")
 message ("output sent to")
@@ -20,7 +21,7 @@ message ("   ${OUTPUT_DIR}")
 
 # Run command
 execute_process(
-    COMMAND ${TOOLCMD} ${TOOLARGS}
+    COMMAND ${TOOLINVOKE}
     WORKING_DIRECTORY ${WORKING_DIR}
     OUTPUT_FILE ${OUTPUT_DIR}/stdout.txt
     ERROR_FILE ${OUTPUT_DIR}/stderr.txt

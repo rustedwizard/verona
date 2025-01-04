@@ -1,78 +1,67 @@
-cmake_minimum_required(VERSION 3.10.0)
+add_executable(verona
+  lang.cc
+  lookup.cc
+  main.cc
+  parse.cc
+  subtype.cc
+  passes/modules.cc
+  passes/structure.cc
+  passes/conditionals.cc
+  passes/reference.cc
+  passes/typenames.cc
+  passes/typeview.cc
+  passes/typefunc.cc
+  passes/typealg.cc
+  passes/typeflat.cc
+  passes/typevalid.cc
+  passes/typereference.cc
+  passes/codereuse.cc
+  passes/memberconflict.cc
+  passes/resetimplicit.cc
+  passes/reverseapp.cc
+  passes/application.cc
+  passes/assignlhs.cc
+  passes/localvar.cc
+  passes/assignment.cc
+  passes/nlrcheck.cc
+  passes/lambda.cc
+  passes/autofields.cc
+  passes/autorhs.cc
+  passes/autocreate.cc
+  passes/defaultargs.cc
+  passes/partialapp.cc
+  passes/traitisect.cc
+  passes/anf.cc
+  passes/defbeforeuse.cc
+  passes/drop.cc
+  passes/validtypeargs.cc
+  passes/typeinfer.cc
+)
 
-include_directories(.)
+target_precompile_headers(verona
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/btype.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/lang.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/lookup.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/subtype.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/wf.h
+)
 
-project(verona-lang CXX)
+target_link_libraries(verona
+  Threads::Threads
+  fmt::fmt
+  trieste::trieste
+)
 
-set(CMAKE_CXX_STANDARD 17)
-
-message(STATUS "Build Type for Verona ${CMAKE_BUILD_TYPE}")
-set(CMAKE_CONFIGURATION_TYPES  Release Debug RelWithDebInfo)
-message(STATUS "Build types ${CMAKE_CONFIGURATION_TYPES}")
-
-if (VERONA_CI_BUILD)
-  # Specify policy to go into child projects.
-  set (CMAKE_POLICY_DEFAULT_CMP0077 NEW)
-  set (SNMALLOC_CI_BUILD ON)
-endif ()
-
-include(../cmake/enable-asserts.cmake)
-if (ENABLE_ASSERTS)
-  enable_asserts()
+if (VERONA_SANITIZER)
+  target_compile_options(verona PUBLIC
+    -fsanitize=${VERONA_SANITIZER} -g -fno-omit-frame-pointer
+  )
+  target_link_options(verona PUBLIC
+    -fsanitize=${VERONA_SANITIZER}
+  )
 endif()
 
-# Sanitizers must be added first, or it gets upset.
-if(SANITIZER)
-  if(MSVC)
-    message(FATAL_ERROR "MSVC does not support sanitizers")
-  endif()
-  message(STATUS "Using sanitizer=${SANITIZER}")
-  add_compile_options(-fsanitize=${SANITIZER})
-  add_link_options(-fsanitize=${SANITIZER})
-  # Disable vptr check in UBSAN (incompatible with -no-rtti used by LLVM)
-  # https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#available-checks
-  if (SANITIZER MATCHES "undefined")
-    add_compile_options(-fno-sanitize=vptr)
-    add_link_options(-fno-sanitize=vptr)
-  endif()
-endif()
+add_test(NAME verona COMMAND verona test -f)
 
-add_subdirectory(../external/CLI11 ./external/CLI11 EXCLUDE_FROM_ALL)
-add_subdirectory(../external/fmt ./external/fmt EXCLUDE_FROM_ALL)
-add_subdirectory(../external/pegmatite ./external/pegmatite EXCLUDE_FROM_ALL)
-
-add_library(cpp-peglib INTERFACE)
-target_include_directories(cpp-peglib INTERFACE ../external/cpp-peglib)
-
-if(MSVC)
-  add_compile_options(/permissive-)
-  add_compile_options(/utf-8)
-  add_compile_options(/wd4307)
-  add_compile_options(/wd4267)
-  add_compile_options(/wd4291)
-  add_compile_options(/wd4624)
-endif()
-
-set (VERONA_RT_ONLY_HEADER_LIBRARY ON)
-add_subdirectory(rt)
-
-# Should go to stricter warnings 
-#   warnings_high()
-# But for now, just add some to stop the Windows build breaking
-if(MSVC)
-  add_compile_options(/WX)
-endif()
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  add_compile_options(-Wmismatched-tags)
-endif()
-
-add_subdirectory(parser)
-add_subdirectory(deprecated)
-add_subdirectory(mlir)
-add_subdirectory(interop)
-
-install(CODE [[
-  file(REMOVE_RECURSE ${CMAKE_INSTALL_PREFIX})
-  ]])
-install(DIRECTORY stdlib/ DESTINATION stdlib
-  PATTERN "CMakeLists.txt" EXCLUDE)
+install(TARGETS verona RUNTIME DESTINATION verona)
